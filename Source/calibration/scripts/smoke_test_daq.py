@@ -101,9 +101,10 @@ def main() -> int:
         )
 
         # ---- Phase 2: interactive variation test ----
+        phase2_duration = 4.0
         print(
-            "\nPhase 2: cover/uncover the photodiodes by hand for the next "
-            "2 seconds. Press ENTER to begin (or Ctrl-C to skip)."
+            f"\nPhase 2: cover/uncover the photodiodes by hand for the next "
+            f"{phase2_duration:.0f} seconds. Press ENTER to begin (or Ctrl-C to skip)."
         )
         try:
             input()
@@ -111,8 +112,8 @@ def main() -> int:
             print("  skipped.")
             return 0
 
-        print("  Sampling for 2 seconds...")
-        acq2 = daq.acquire(duration=2.0, channels=channels)
+        print(f"  Sampling for {phase2_duration:.0f} seconds...")
+        acq2 = daq.acquire(duration=phase2_duration, channels=channels)
         print(f"  acquired {acq2.n_samples} samples/channel at {acq2.sample_rate:.0f} Hz")
         _print_stats_table(
             "  Variation-test per-channel statistics (volts):",
