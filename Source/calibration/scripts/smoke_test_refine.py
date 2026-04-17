@@ -31,6 +31,7 @@ from calibration.procedure import (
     DEFAULT_DC_SAMPLE_RATE,
     DEFAULT_K_MIN,
     DEFAULT_REFINE_BAR_WIDTH_PX,
+    DEFAULT_REFINE_MARGIN_PX,
     DEFAULT_REFINE_SETTLE_TIME_S,
     DEFAULT_SETTLE_TIME_S,
     characterize_baselines,
@@ -51,6 +52,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--bar-width", type=int, default=DEFAULT_REFINE_BAR_WIDTH_PX,
         dest="bar_width",
+    )
+    p.add_argument(
+        "--margin", type=int, default=DEFAULT_REFINE_MARGIN_PX, dest="margin",
+        help="extra px beyond the coarse uncertainty window to sweep "
+             "(must exceed the PD's sensitive radius)",
     )
     p.add_argument(
         "--settle", type=float, default=DEFAULT_SETTLE_TIME_S,
@@ -139,6 +145,7 @@ def main() -> int:
             fine = refine_locations(
                 display, daq, baseline, coarse,
                 bar_width=args.bar_width,
+                margin_px=args.margin,
                 settle_time=args.refine_settle,
                 sample_rate=effective_rate,
             )

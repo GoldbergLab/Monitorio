@@ -150,6 +150,16 @@ DEFAULT_REFINE_SETTLE_TIME_S = 0.05
 # centroid a sharper maximum to lock onto.
 DEFAULT_REFINE_BAR_WIDTH_PX = 4
 
+# Extra pixels added to each PD's coarse +/- uncertainty window when the
+# bar sweep runs, on both sides. Sized to be larger than the PD's
+# expected sensitive radius so the sweep captures clean dark baseline
+# on both flanks, not just the rising response. Without this margin, a
+# PD whose true center sits near the edge of the coarse window sees
+# the bar already overlapping its field from the very first sweep
+# position, biasing the centroid and losing the left-flank FWHM.
+# 16 px covers 1206 photodiodes on typical HD pixel pitches.
+DEFAULT_REFINE_MARGIN_PX = 16
+
 
 def characterize_baselines(
     display: Display,
@@ -341,6 +351,7 @@ def refine_locations(
     coarse: CoarseLocations,
     *,
     bar_width: int = DEFAULT_REFINE_BAR_WIDTH_PX,
+    margin_px: int = DEFAULT_REFINE_MARGIN_PX,
     settle_time: float = DEFAULT_REFINE_SETTLE_TIME_S,
     duration: float = DEFAULT_WINDOW_S,
     sample_rate: float | None = None,
@@ -349,9 +360,17 @@ def refine_locations(
     """Refine coarse (x, y) estimates to sub-pixel via a bar-sweep centroid.
 
     For each axis, sweeps a `bar_width`-px bar across the UNION of each
-    PD's coarse +/- uncertainty window, acquires every live PD's response
-    at every bar position, then extracts each PD's center from its own
-    window slice by a noise-rejected weighted centroid.
+    PD's coarse +/- (uncertainty + margin_px) window, acquires every
+    live PD's response at every bar position, then extracts each PD's
+    center from its own window slice by a noise-rejected weighted
+    centroid.
+
+    margin_px: extra pixels added to each window on both sides beyond
+        coarse.uncertainty_px. Needs to be larger than the PD's
+        expected sensitive radius so the sweep sees clean dark baseline
+        on each flank -- otherwise the bar is already overlapping the
+        PD from the first sweep position, biasing the centroid and
+        truncating the left-flank FWHM.
 
     The centroid weighting is max(response - peak_fraction * peak, 0),
     which zeros out readings below `peak_fraction` of the peak height
@@ -370,13 +389,15 @@ def refine_locations(
     dark_m = baseline.dark_mean()[baseline_idx]
     dynamic_range = baseline.dynamic_range()[baseline_idx]
     n_live = len(coarse.channels)
-    uncertainty = int(coarse.uncertainty_px)
+    half_width = int(coarse.uncertainty_px) + int(margin_px)
 
     def sweep_axis(axis: str, length: int, coarse_pos: np.ndarray):
         """Return (sub-pixel centers, FWHM-in-pixels) per channel for one axis."""
-        # Per-PD windows, clipped to screen bounds.
+        # Per-PD windows, clipped to screen bounds. half_width includes both
+        # the coarse-localization uncertainty and a margin for the PD's own
+        # sensitive radius.
         windows = [
-            (max(0, int(c) - uncertainty), min(length - 1, int(c) + uncertainty))
+            (max(0, int(c) - half_width), min(length - 1, int(c) + half_width))
             for c in coarse_pos
         ]
         # Union of windows as a sorted list of unique positions to display.
