@@ -7,8 +7,9 @@ pygame-ce>=2.5
 
 numpy>=1.26
 
-# Added in piece 2 (DAQ integration):
-# nidaqmx>=1.0
+# NI-DAQmx Python wrapper. Requires the NI-DAQmx driver to be installed
+# separately on the host OS (not pip-installable).
+nidaqmx>=1.0
 
 # Added in piece 8 (diagnostic plotting):
 # matplotlib>=3.8
