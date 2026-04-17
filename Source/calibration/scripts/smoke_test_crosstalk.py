@@ -22,14 +22,12 @@ import numpy as np
 
 from calibration.daq import DAQ, list_ai_channels, list_devices
 from calibration.display import Display, list_displays
+from calibration.io import get_or_measure_pipeline
 from calibration.procedure import (
     DEFAULT_CROSSTALK_THRESHOLD,
     DEFAULT_DC_SAMPLE_RATE,
-    characterize_baselines,
-    localize_coarse,
     measure_crosstalk,
     pick_bit_radius_px,
-    refine_locations,
 )
 
 
@@ -40,6 +38,16 @@ def _parse_args(argv):
     p.add_argument(
         "--threshold", type=float, default=DEFAULT_CROSSTALK_THRESHOLD,
         help="max acceptable off-diagonal fraction of own dynamic range",
+    )
+    p.add_argument(
+        "--cache", type=str, default=None,
+        help="path to .npz cache of baselines+coarse+fine. Loaded if it "
+             "exists; written after measurement if it doesn't. Skips the "
+             "slow (~1-2 min) localization step on subsequent runs.",
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="ignore any existing --cache and re-measure baselines+coarse+fine",
     )
     p.add_argument("--plot", action="store_true")
     return p.parse_args(argv)
@@ -72,11 +80,11 @@ def main() -> int:
             ):
                 return 0
 
-            print("\nbaselines...")
-            baseline = characterize_baselines(display, daq, channels=chans)
-            coarse = localize_coarse(display, daq, baseline)
-            print("fine refine...")
-            fine = refine_locations(display, daq, baseline, coarse)
+            state = get_or_measure_pipeline(
+                display, daq, cache_path=args.cache, force=args.force,
+                channels=chans,
+            )
+            baseline, fine = state.baseline, state.fine
             radii = pick_bit_radius_px(fine)
             print(f"picked radii (px): {list(radii)}")
             print("crosstalk...")

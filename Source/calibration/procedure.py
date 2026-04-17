@@ -724,6 +724,78 @@ DEFAULT_NEIGHBOR_CLEARANCE = 0.4
 DEFAULT_CROSSTALK_THRESHOLD = 0.05
 
 
+# Default "how far out the PD still sees light" threshold. A position
+# at which the bar-sweep response drops below this fraction of the PD's
+# baseline dynamic range is considered outside the PD's sensitive field.
+# 1% means a white pixel there contributes <=1% of a full-bright
+# reading to the PD -- negligible against the ~75% bit-on vs. ~0% bit-off
+# separation we see in the crosstalk measurement.
+DEFAULT_BACKGROUND_RESPONSE_THRESHOLD = 0.01
+
+
+def pick_background_radius_px(
+    fine: FineLocations,
+    baseline: BaselineResult,
+    *,
+    response_threshold: float = DEFAULT_BACKGROUND_RESPONSE_THRESHOLD,
+    extra_margin_px: int = 4,
+) -> np.ndarray:
+    """Pick the black-background disk radius per PD.
+
+    The background disk is the larger black region drawn behind each
+    bit circle in addVideoSyncTags, whose job is to prevent the
+    underlying video frame from bleeding into the photodiode during a
+    bit-off read. This function sizes it to be large enough that the
+    PD doesn't see past its edge.
+
+    Procedure: use the fine-refinement bar sweeps (already captured in
+    `fine.x_sweeps` / `fine.y_sweeps`) to find, per axis, the max
+    distance from the PD's fine center at which the sweep response
+    still exceeds `response_threshold * baseline.dynamic_range`. Take
+    the max across axes, add `extra_margin_px` for safety.
+
+    Returns an int array, one radius per channel. A value of 0 means
+    the sweep never exceeded the threshold (typically because the PD
+    wasn't responsive or the sweep window was entirely past the PD).
+
+    Caveats:
+    - The sweep window extends only `coarse.uncertainty_px + margin_px`
+      from the coarse position; if the PD has response tails beyond
+      that, this function reports the window edge, understating the
+      true background radius. On a typical rig (FWHM ~24 px, sweep
+      half-width 32 px) the tails have decayed to ~0 well within the
+      window.
+    - extra_margin_px protects against small measurement noise at the
+      threshold crossing and minor PD misalignment vs. screen pixels.
+    """
+    baseline_idx = [baseline.channels.index(c) for c in fine.channels]
+    dyn_range = baseline.dynamic_range()[baseline_idx]
+
+    n = len(fine.channels)
+    radii = np.zeros(n, dtype=np.int64)
+
+    for i in range(n):
+        thresh_abs = float(response_threshold * dyn_range[i])
+        half_widths: list[float] = []
+        for (center, sweeps) in (
+            (fine.x_pixels[i], fine.x_sweeps),
+            (fine.y_pixels[i], fine.y_sweeps),
+        ):
+            if np.isnan(center):
+                continue
+            pos, resp = sweeps[i]
+            above = resp > thresh_abs
+            if not above.any():
+                continue
+            dists = np.abs(pos[above] - float(center))
+            half_widths.append(float(dists.max()))
+        if not half_widths:
+            radii[i] = 0
+            continue
+        radii[i] = int(np.ceil(max(half_widths))) + int(extra_margin_px)
+    return radii
+
+
 def pick_bit_radius_px(
     fine: FineLocations,
     *,

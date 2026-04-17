@@ -24,15 +24,13 @@ import numpy as np
 
 from calibration.daq import DAQ, list_ai_channels, list_devices
 from calibration.display import Display, list_displays
+from calibration.io import get_or_measure_pipeline
 from calibration.procedure import (
     DEFAULT_DC_SAMPLE_RATE,
     DEFAULT_RISE_PRE_FLIP_S,
     DEFAULT_RISE_SAMPLE_RATE,
     DEFAULT_RISE_WINDOW_S,
-    characterize_baselines,
-    localize_coarse,
     measure_rise_times,
-    refine_locations,
 )
 
 
@@ -64,6 +62,16 @@ def _parse_args(argv):
         "--plot", action="store_true",
         help="show a matplotlib figure of the rise and fall traces after "
              "measurement completes",
+    )
+    p.add_argument(
+        "--cache", type=str, default=None,
+        help="path to .npz cache of baselines+coarse+fine. Loaded if it "
+             "exists; written after measurement if it doesn't. Skips the "
+             "slow (~1-2 min) localization step on subsequent runs.",
+    )
+    p.add_argument(
+        "--force", action="store_true",
+        help="ignore any existing --cache and re-measure baselines+coarse+fine",
     )
     return p.parse_args(argv)
 
@@ -102,18 +110,11 @@ def main() -> int:
             ):
                 return 0
 
-            print("\nbaselines...")
-            baseline = characterize_baselines(display, daq, channels=chans)
-            live = [c for c, l in zip(baseline.channels, baseline.liveness()) if l]
-            if not live:
-                display.message("No live channels.")
-                display.flip(); display.wait_for_key()
-                return 1
-
-            print("coarse localize...")
-            coarse = localize_coarse(display, daq, baseline, channels=live)
-            print("fine refine...")
-            fine = refine_locations(display, daq, baseline, coarse)
+            state = get_or_measure_pipeline(
+                display, daq, cache_path=args.cache, force=args.force,
+                channels=chans,
+            )
+            fine = state.fine
             print("rise times...")
             rt = measure_rise_times(
                 display, daq, fine,
