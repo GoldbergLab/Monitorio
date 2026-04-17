@@ -7,14 +7,22 @@ as well as printed to the terminal.
 
 Usage:
     venv\\Scripts\\python Source\\calibration\\scripts\\smoke_test_baselines.py \\
-        [display_index] [device_name] [n_channels]
+        [--display N] [--device NAME] [--channels N] [--sample-rate HZ]
 
 Defaults: display 0, first detected DAQ device, as many channels as fit at
-the DAQ's default sample rate.
+the DAQ's default sample rate, DAQ's default sample rate.
+
+Lowering --sample-rate is useful for diagnosing multiplexer settling
+crosstalk on NI DAQs: at low rates (e.g. 5000 Hz) the mux has more
+time per channel to settle, and residual voltage from neighboring
+channels drops substantially. DC-level measurements like baselines
+don't benefit from high rate, so a slower rate is the better default
+for this kind of measurement anyway.
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -50,7 +58,21 @@ def _both(display, msg, *, duration_hint: str = ""):
     return display.wait_for_key()  # True on ESC
 
 
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--display", type=int, default=0, help="display index")
+    p.add_argument("--device", type=str, default=None, help="DAQ device name (e.g. Dev1)")
+    p.add_argument("--channels", type=int, default=None, help="number of AI channels to test")
+    p.add_argument(
+        "--sample-rate", type=float, default=None, dest="sample_rate",
+        help="per-channel sample rate in Hz (defaults to DAQ's default)",
+    )
+    return p.parse_args(argv)
+
+
 def main() -> int:
+    args = _parse_args(sys.argv[1:])
+
     displays = list_displays()
     devices = list_devices()
     print("Displays:")
@@ -66,15 +88,21 @@ def main() -> int:
         print("\nNo display found.")
         return 1
 
-    display_index = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-    device_name = sys.argv[2] if len(sys.argv) > 2 else devices[0]
+    display_index = args.display
+    device_name = args.device if args.device is not None else devices[0]
 
     all_chans = list_ai_channels(device_name)
 
-    with DAQ(device_name) as daq:
-        max_at_default_rate = int(daq.max_multi_channel_rate // daq.sample_rate)
-        default_n = min(len(all_chans), max_at_default_rate)
-        n_channels = int(sys.argv[3]) if len(sys.argv) > 3 else default_n
+    # If --sample-rate was given, configure the DAQ for it up front so the
+    # aggregate-rate sanity check at acquire time uses the right rate.
+    daq_kwargs = {}
+    if args.sample_rate is not None:
+        daq_kwargs["sample_rate"] = args.sample_rate
+
+    with DAQ(device_name, **daq_kwargs) as daq:
+        max_at_rate = int(daq.max_multi_channel_rate // daq.sample_rate)
+        default_n = min(len(all_chans), max_at_rate)
+        n_channels = args.channels if args.channels is not None else default_n
         n_channels = min(n_channels, len(all_chans))
         channels = tuple(all_chans[:n_channels])
 
