@@ -133,8 +133,22 @@ class BaselineResult:
 # the bit decode becomes random. A 1206 PD on a typical HD monitor spans
 # roughly 10-20 pixels, so k_min=5 (32-px stripes) gives comfortable
 # headroom. Localization uncertainty is +/- 2**(k_min-1) pixels, refined
-# later by a bar sweep (piece 5).
+# by the bar sweep in refine_locations().
 DEFAULT_K_MIN = 5
+
+# Settle time used by refine_locations()'s bar sweep. Each step changes
+# only two columns (new column turns on, old column turns off) relative
+# to the previous bar position, so the monitor's pixel-response ramp is
+# much shorter than in the baselines/localization steps where the whole
+# screen changes. 50 ms covers even slow LCDs; OLED would be happy at
+# ~5 ms.
+DEFAULT_REFINE_SETTLE_TIME_S = 0.05
+
+# Default bar thickness for the fine sweep. Thinner than the PD's
+# effective diameter so the per-position response looks like a clean
+# trapezoid with a peak (not a long plateau), giving the weighted
+# centroid a sharper maximum to lock onto.
+DEFAULT_REFINE_BAR_WIDTH_PX = 4
 
 
 def characterize_baselines(
@@ -296,4 +310,143 @@ def localize_coarse(
         y_pixels=y_pixels,
         uncertainty_px=(1 << k_min) // 2,
         min_confidence=np.minimum(x_conf, y_conf),
+    )
+
+
+@dataclass(frozen=True)
+class FineLocations:
+    """Per-channel sub-pixel PD centers from a bar-sweep centroid refinement.
+
+    x_pixels, y_pixels are floats (sub-pixel). A value of NaN means the
+    refinement failed for that channel on that axis (typically: no clear
+    peak was seen inside the coarse-location window).
+
+    x_fwhm_px, y_fwhm_px are integer pixel counts at each PD's response
+    above half-max on the respective axis. Useful as an estimate of the
+    PD's sensitive diameter, which downstream steps (diameter sweep,
+    circle placement) can seed from.
+    """
+
+    channels: tuple[str, ...]
+    x_pixels: np.ndarray
+    y_pixels: np.ndarray
+    x_fwhm_px: np.ndarray
+    y_fwhm_px: np.ndarray
+
+
+def refine_locations(
+    display: Display,
+    daq: DAQ,
+    baseline: BaselineResult,
+    coarse: CoarseLocations,
+    *,
+    bar_width: int = DEFAULT_REFINE_BAR_WIDTH_PX,
+    settle_time: float = DEFAULT_REFINE_SETTLE_TIME_S,
+    duration: float = DEFAULT_WINDOW_S,
+    sample_rate: float | None = None,
+    peak_fraction: float = 0.1,
+) -> FineLocations:
+    """Refine coarse (x, y) estimates to sub-pixel via a bar-sweep centroid.
+
+    For each axis, sweeps a `bar_width`-px bar across the UNION of each
+    PD's coarse +/- uncertainty window, acquires every live PD's response
+    at every bar position, then extracts each PD's center from its own
+    window slice by a noise-rejected weighted centroid.
+
+    The centroid weighting is max(response - peak_fraction * peak, 0),
+    which zeros out readings below `peak_fraction` of the peak height
+    on the positive side while leaving the peak region intact -- so a
+    flat background doesn't pull the center off.
+
+    Bar width should be smaller than the PD's effective diameter; the
+    response curve is then a clean trapezoid with a peak at the PD
+    center, giving the centroid a sharp maximum. Wider bars also work
+    (flat-top centroid is still centered) but give a flatter peak.
+    """
+    rate = sample_rate if sample_rate is not None else DEFAULT_DC_SAMPLE_RATE
+
+    # Match target_channels to baseline so we can pull per-channel darks.
+    baseline_idx = [baseline.channels.index(c) for c in coarse.channels]
+    dark_m = baseline.dark_mean()[baseline_idx]
+    dynamic_range = baseline.dynamic_range()[baseline_idx]
+    n_live = len(coarse.channels)
+    uncertainty = int(coarse.uncertainty_px)
+
+    def sweep_axis(axis: str, length: int, coarse_pos: np.ndarray):
+        """Return (sub-pixel centers, FWHM-in-pixels) per channel for one axis."""
+        # Per-PD windows, clipped to screen bounds.
+        windows = [
+            (max(0, int(c) - uncertainty), min(length - 1, int(c) + uncertainty))
+            for c in coarse_pos
+        ]
+        # Union of windows as a sorted list of unique positions to display.
+        positions_set: set[int] = set()
+        for lo, hi in windows:
+            positions_set.update(range(lo, hi + 1))
+        positions = sorted(positions_set)
+        if not positions:
+            return (
+                np.full(n_live, np.nan),
+                np.zeros(n_live, dtype=np.int64),
+            )
+
+        responses = np.zeros((n_live, len(positions)), dtype=np.float64)
+        half_bar = bar_width // 2
+        for i, pos in enumerate(positions):
+            # Draw bar centered on `pos`. The bar's left/top edge is pos-half_bar.
+            start = pos - half_bar
+            if axis == "x":
+                draw = lambda d, s=start: d.vertical_bar(s, bar_width)
+            else:
+                draw = lambda d, s=start: d.horizontal_bar(s, bar_width)
+            acq = measure_after_render(
+                display, daq, draw,
+                settle_time=settle_time, duration=duration,
+                channels=coarse.channels, sample_rate=rate,
+            )
+            # Subtract per-channel dark so "response" is the above-dark signal.
+            responses[:, i] = acq.mean() - dark_m
+
+        positions_arr = np.asarray(positions, dtype=np.float64)
+        centers = np.full(n_live, np.nan, dtype=np.float64)
+        fwhms = np.zeros(n_live, dtype=np.int64)
+
+        # Minimum peak height (in volts above dark) to trust the refinement:
+        # require the PD to have lit up to at least 10% of its baseline range.
+        min_peak = 0.10 * dynamic_range
+
+        for j in range(n_live):
+            lo, hi = windows[j]
+            mask = (positions_arr >= lo) & (positions_arr <= hi)
+            pos_j = positions_arr[mask]
+            resp_j = responses[j, mask]
+            if resp_j.size == 0:
+                continue
+            peak = float(resp_j.max())
+            if peak < min_peak[j]:
+                continue  # leave as NaN
+
+            # Noise-rejected weighted centroid.
+            weights = np.maximum(resp_j - peak_fraction * peak, 0.0)
+            wsum = weights.sum()
+            if wsum > 0:
+                centers[j] = float((pos_j * weights).sum() / wsum)
+
+            # FWHM (pixel count above half-peak; integer estimate of PD diameter).
+            fwhms[j] = int(np.count_nonzero(resp_j >= peak / 2.0))
+
+        return centers, fwhms
+
+    x_fine, x_fwhm = sweep_axis("x", display.width, coarse.x_pixels)
+    y_fine, y_fwhm = sweep_axis("y", display.height, coarse.y_pixels)
+
+    display.black()
+    display.flip()
+
+    return FineLocations(
+        channels=coarse.channels,
+        x_pixels=x_fine,
+        y_pixels=y_fine,
+        x_fwhm_px=x_fwhm,
+        y_fwhm_px=y_fwhm,
     )
