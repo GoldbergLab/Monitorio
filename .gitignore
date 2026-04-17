@@ -11,3 +11,10 @@ __pycache__/
 
 # Claude Code local state
 .claude/
+
+# Calibration artifacts: timestamped per-rig measurement outputs that
+# shouldn't be committed casually. git add -f any specific one you
+# want to retain.
+calibration_cache.npz
+calibration_*.json
+rise_time_traces_*.npz
