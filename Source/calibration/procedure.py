@@ -564,9 +564,18 @@ def _detect_transition(
     """Return (latency_s, duration_10_90_s) for a trace with one transition.
 
     Normalizes trace to [0, 1] on (baseline mean, plateau mean) so the
-    same code handles rise and fall; looks for the first sustained 10%
-    and 90% crossings (sub-frame spikes that drop below the threshold
-    within sustain_s are rejected).
+    same code handles rise and fall.
+
+    The 10% crossing uses `sustain_s` to reject sub-frame dips from
+    baseline (e.g. scan-line artifacts) that would otherwise fake out
+    the detector. The 90% crossing takes the FIRST sample at or past
+    90% on or after the 10% crossing -- no sustain. Sub-frame noise
+    almost never rises from baseline all the way to 90% of plateau, so
+    sustained matching isn't buying us anything at that level; and on
+    some displays the initial rising edge briefly overshoots above 90%
+    before decaying as part of the frame's normal brightness ramp,
+    which would leave a sustained search stuck hunting for the next
+    refresh peak.
     """
     n = trace.size
     n_pre = max(20, n // 20)    # first 5% -> baseline
@@ -580,9 +589,15 @@ def _detect_transition(
     norm = (trace - baseline) / span  # 0 at baseline, 1 at plateau
     sustain_n = max(1, int(round(sustain_s * sample_rate)))
     i10 = _first_sustained_crossing(norm >= 0.1, sustain_n)
-    i90 = _first_sustained_crossing(norm >= 0.9, sustain_n)
-    if i10 < 0 or i90 < 0 or i90 <= i10:
+    if i10 < 0:
         return float("nan"), float("nan")
+    # First 90%+ sample at or after the sustained 10% crossing. Allow
+    # i90 == i10: that just means the transition took less than one
+    # sample period to complete (a legitimate, resolution-limited 0).
+    post_i10 = norm[i10:] >= 0.9
+    if not post_i10.any():
+        return float("nan"), float("nan")
+    i90 = i10 + int(np.argmax(post_i10))
     return i10 / sample_rate, (i90 - i10) / sample_rate
 
 
