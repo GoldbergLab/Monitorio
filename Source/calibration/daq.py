@@ -292,3 +292,32 @@ def list_ai_channels(device_name: str) -> list[str]:
     """Return every AI physical channel name on the named device."""
     dev = System.local().devices[device_name]
     return [c.name for c in dev.ai_physical_chans]
+
+
+# CLI-friendly names for the nidaqmx TerminalConfiguration enum. Excludes
+# DEFAULT because that's just "whatever the card's own default is" and
+# surprises downstream -- our code should always pass an explicit
+# configuration.
+TERMINAL_CONFIG_CHOICES = ("RSE", "DIFF", "NRSE", "PSEUDO_DIFF")
+
+
+def terminal_config_from_name(name: str) -> TerminalConfiguration:
+    """Resolve a case-insensitive name to a nidaqmx TerminalConfiguration.
+
+    Accepts: 'RSE' (referenced single-ended, default), 'DIFF'
+    (differential), 'NRSE' (non-referenced single-ended), or
+    'PSEUDO_DIFF'. Raises ValueError for any other string.
+    """
+    m = {
+        "RSE": TerminalConfiguration.RSE,
+        "DIFF": TerminalConfiguration.DIFF,
+        "NRSE": TerminalConfiguration.NRSE,
+        "PSEUDO_DIFF": TerminalConfiguration.PSEUDO_DIFF,
+    }
+    key = name.upper()
+    if key not in m:
+        raise ValueError(
+            f"Unknown terminal config {name!r}; expected one of "
+            f"{TERMINAL_CONFIG_CHOICES}"
+        )
+    return m[key]

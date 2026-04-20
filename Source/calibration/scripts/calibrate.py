@@ -37,7 +37,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 
-from calibration.daq import DAQ, list_ai_channels, list_devices
+from calibration.daq import (
+    DAQ,
+    TERMINAL_CONFIG_CHOICES,
+    list_ai_channels,
+    list_devices,
+    terminal_config_from_name,
+)
 from calibration.display import Display, list_displays
 from calibration.io import get_or_measure_pipeline
 from calibration.procedure import (
@@ -75,6 +81,11 @@ def _parse_args(argv):
     p.add_argument(
         "--crosstalk-threshold", type=float, default=DEFAULT_CROSSTALK_THRESHOLD,
         dest="crosstalk_threshold",
+    )
+    p.add_argument(
+        "--terminal-config", type=str.upper, default="RSE",
+        choices=TERMINAL_CONFIG_CHOICES, dest="terminal_config",
+        help="AI terminal configuration (default: RSE)",
     )
     return p.parse_args(argv)
 
@@ -125,6 +136,7 @@ def _build_json(
     *, state, rt, xt, bit_radii, bg_radii,
     display_index: int, display_w: int, display_h: int,
     device_name: str, product_type: str, sample_rate_hz: float,
+    terminal_config: str,
 ) -> dict:
     def _nan_to_none(x):
         x = float(x)
@@ -164,6 +176,7 @@ def _build_json(
         "daq": {
             "device": device_name,
             "product_type": product_type,
+            "terminal_config": terminal_config,
             "dc_sample_rate_hz": float(sample_rate_hz),
             "rise_time_sample_rate_hz": float(rt.sample_rate),
         },
@@ -194,7 +207,9 @@ def main() -> int:
     )
 
     # --- Hardware phase: measure everything. -------------------------
-    with DAQ(device_name) as daq:
+    tc = terminal_config_from_name(args.terminal_config)
+    print(f"Terminal config: {args.terminal_config}")
+    with DAQ(device_name, terminal_config=tc) as daq:
         with Display(args.display) as display:
             product_type = daq.product_type
             display_w, display_h = display.width, display.height
@@ -250,6 +265,7 @@ def main() -> int:
         display_index=args.display, display_w=display_w, display_h=display_h,
         device_name=device_name, product_type=product_type,
         sample_rate_hz=DEFAULT_DC_SAMPLE_RATE,
+        terminal_config=args.terminal_config,
     )
 
     if not args.no_confirm:

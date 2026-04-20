@@ -321,6 +321,7 @@ def _run_calibrate_subprocess(
     device: str | None,
     cache: str | None,
     force: bool,
+    terminal_config: str | None,
 ) -> None:
     """Invoke calibration/scripts/calibrate.py, writing JSON to out_path.
 
@@ -339,6 +340,8 @@ def _run_calibrate_subprocess(
         cmd += ["--cache", cache]
     if force:
         cmd += ["--force"]
+    if terminal_config is not None:
+        cmd += ["--terminal-config", terminal_config]
 
     print(f"Running calibration: {' '.join(cmd)}")
     proc = subprocess.run(cmd)
@@ -394,6 +397,13 @@ def _cli():
         "--force", action="store_true",
         help="ignore any existing --cache and re-measure baselines+coarse+fine",
     )
+    cal_fwd.add_argument(
+        "--terminal-config", type=str.upper, default=None,
+        dest="terminal_config",
+        choices=("RSE", "DIFF", "NRSE", "PSEUDO_DIFF"),
+        help="AI terminal configuration to pass through to calibrate.py "
+             "(default: the script's own default, currently RSE)",
+    )
 
     tag = p.add_argument_group("tagging options")
     tag.add_argument(
@@ -432,6 +442,7 @@ def _cli():
                 out_path=cal_path,
                 display=args.display, device=args.device,
                 cache=args.cache, force=args.force,
+                terminal_config=args.terminal_config,
             )
             _tag(str(cal_path))
     else:
