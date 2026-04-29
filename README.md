@@ -283,6 +283,26 @@ rig where the full `calibrate.py` is misbehaving. They all default to
 RSE; modify them if you need a different terminal config.
 
 
+## Automated test suite
+
+`tests/` holds pytest-based regression tests for the parts of the
+codebase that are testable without rig hardware: Gray-code encode/
+decode and wrap invariants, parameter resolution priorities, terminal-
+config-aware AI channel filtering (with nidaqmx mocked), and
+end-to-end aspect-ratio scaling of the tagging pipeline against
+synthetic ffmpeg videos.
+
+```bash
+pip install -r requirements-dev.txt
+pytest                # from repo root; auto-discovers tests/
+pytest tests/test_gray.py -v        # one file
+pytest -k "aspect_scaling"          # one keyword
+```
+
+Tests that need ffmpeg auto-skip if it isn't on `PATH`; the nidaqmx
+filter tests skip if the `nidaqmx` package isn't importable.
+
+
 ## Caveats and limitations
 
 - LCDs have slow pixels and may show PWM in their backlight. The
