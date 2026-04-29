@@ -49,6 +49,29 @@ timestamp). Note that frame 2**n_bits, 2*2**n_bits, ... map to gray(0),
 i.e. all bits off, which is visually indistinguishable from an
 unillumated tag area; downstream code should tolerate that case.
 
+Sync-bit mode (sync_bit=True / --sync-bit)
+------------------------------------------
+Reserves the FIRST photodiode (PD index 0 in the calibration JSON, which
+corresponds to the first live AI channel in physical-pin order) as a
+"video active" indicator: it's drawn lit on every video frame, never
+dark. The remaining n-1 PDs encode the frame number in (n-1)-bit Gray
+code, cycling every 2**(n-1) frames. The decoder can then unambiguously
+tell "video off" (sync bit dark) from any frame state (sync bit lit),
+which the default mode cannot guarantee because frame numbers at every
+multiple of 2**n_bits Gray-encode to all bits off.
+
+Cost: one bit, so cycle drops by 2x (e.g. 16 -> 8 with 4 PDs); frame
+numbers wrap more often, and the decoder has to disambiguate cycles
+more frequently from timing.
+
+Channel-order convention: photodiodes appear in the calibration JSON in
+the same order as their AI channels in physical-pin order (which is how
+list_ai_channels enumerates them). The tagger reads them in that order:
+when sync_bit is False, PD index k carries Gray-code bit k; when
+sync_bit is True, PD index 0 is the sync bit and PD index k+1 carries
+Gray-code bit k for k in [0, n-1). The decoder must apply the same
+convention with the same calibration JSON.
+
 Parameter resolution for each of bit_xs / bit_ys / bit_radius /
 background_radius / screen_size:
     1. Value passed explicitly to add_video_sync_tags() wins.
@@ -92,6 +115,7 @@ def add_video_sync_tags(
     bit_radius: int | None = None,
     background_radius: int | None = None,
     screen_size: tuple[int, int] | None = None,
+    sync_bit: bool = True,
     codec: str = "libx264",
     preset: str | None = None,
     quality: int = 18,
@@ -119,6 +143,12 @@ def add_video_sync_tags(
     quality: visual-quality knob. For libx264 it's mapped to -crf;
              for *_nvenc it's mapped to -cq. 18 is "perceptually
              indistinguishable from source" for both encoders.
+    sync_bit: if True, dedicate the first PD as an always-on
+             "video active" indicator and Gray-encode the frame number
+             across the remaining n-1 PDs. Lets the decoder cleanly
+             distinguish "video off" from "frame at a multiple of
+             2**n_bits" (which would otherwise both look all-dark).
+             Cycle length is halved (2**(n-1) instead of 2**n).
     """
     video_in = Path(video_in)
     video_out = Path(video_out)
@@ -130,17 +160,44 @@ def add_video_sync_tags(
         screen_size,
     )
     screen_w, screen_h = screen
-    n_bits = max(len(xs), len(ys))
+    n_pds = max(len(xs), len(ys))
     if len(xs) == 1:
-        xs = np.tile(xs, n_bits)
+        xs = np.tile(xs, n_pds)
     if len(ys) == 1:
-        ys = np.tile(ys, n_bits)
-    if len(xs) != n_bits or len(ys) != n_bits:
+        ys = np.tile(ys, n_pds)
+    if len(xs) != n_pds or len(ys) != n_pds:
         raise ValueError(
             f"bit_xs and bit_ys must be broadcast-compatible: "
             f"got len(bit_xs)={len(xs)}, len(bit_ys)={len(ys)}"
         )
-    cycle = 1 << n_bits  # grayEncode maps [0, 2**n) -> [0, 2**n) bijectively
+    if sync_bit and n_pds < 2:
+        raise ValueError(
+            "sync_bit=True needs at least 2 photodiodes (one for the "
+            "sync indicator + at least one for the frame number); only "
+            f"got {n_pds}. Either add a PD or set sync_bit=False."
+        )
+    # Convention: PDs are listed in physical AI-channel order. With
+    # sync_bit=True, PD index 0 is the always-on indicator and PDs
+    # [1..n_pds) carry the n_pds-1 Gray-code frame bits. Without it, all
+    # n_pds PDs are frame bits.
+    sync_idx = 0 if sync_bit else None
+    frame_bit_idx = list(range(1, n_pds)) if sync_bit else list(range(n_pds))
+    n_frame_bits = len(frame_bit_idx)
+    cycle = 1 << n_frame_bits  # grayEncode maps [0, 2**n) -> [0, 2**n) bijectively
+
+    # Announce the bit assignment so a decoder author can confirm they're
+    # reading the right channel for each role. Uses calibration JSON
+    # channel names if available, else generic indices.
+    cal_channels = _read_channel_names(calibration_file) if calibration_file else None
+    def _label(i: int) -> str:
+        return cal_channels[i] if cal_channels and i < len(cal_channels) else f"PD#{i}"
+    if sync_bit:
+        print(f"  sync bit: {_label(sync_idx)}", file=sys.stderr)
+    print(
+        "  frame bits: "
+        + ", ".join(f"bit {k}={_label(idx)}" for k, idx in enumerate(frame_bit_idx)),
+        file=sys.stderr,
+    )
 
     info = _probe_video(video_in)
     w, h, fps, n_frames = info["width"], info["height"], info["fps"], info["n_frames"]
@@ -215,10 +272,11 @@ def add_video_sync_tags(
         # to), but warn so a user who didn't realize they were wrapping isn't
         # surprised when their decoder sees repeated codes.
         n_cycles = n_frames / cycle
+        sync_note = " (1 PD reserved as sync)" if sync_bit else ""
         print(
-            f"  note: {n_frames} frames > 2**{n_bits} = {cycle}; "
-            f"frame number will wrap {n_cycles:.1f} times. Decoder must "
-            f"disambiguate cycles via timestamp.",
+            f"  note: {n_frames} frames > 2**{n_frame_bits} = {cycle}"
+            f"{sync_note}; frame number will wrap {n_cycles:.1f} times. "
+            f"Decoder must disambiguate cycles via timestamp.",
             file=sys.stderr,
         )
 
@@ -294,19 +352,22 @@ def add_video_sync_tags(
                 draw_target = frame.copy()
 
             frames_written += 1
-            # Wrap modulo cycle so videos longer than 2**n_bits frames keep
-            # encoding cleanly; gray() over a full [0, 2**n_bits) cycle has
+            # Wrap modulo cycle so videos longer than 2**n_frame_bits frames
+            # keep encoding cleanly; gray() over a full [0, 2**n) cycle has
             # the single-bit-change property at every step including the
             # wrap edge.
             g = int(gray.encode(np.int64(frames_written % cycle)))
 
-            # Always-on black backgrounds.
+            # Always-on black backgrounds for every PD.
             for m in bg_masks:
                 _apply_mask(draw_target, m, 0)
-            # White-on-black for every bit of g that's set.
-            for k in range(n_bits):
+            # Sync-bit PD (if enabled): always lit on every video frame.
+            if sync_idx is not None:
+                _apply_mask(draw_target, bit_masks[sync_idx], 255)
+            # Frame-bit PDs: light bit k of g via PD at frame_bit_idx[k].
+            for k in range(n_frame_bits):
                 if (g >> k) & 1:
-                    _apply_mask(draw_target, bit_masks[k], 255)
+                    _apply_mask(draw_target, bit_masks[frame_bit_idx[k]], 255)
 
             write_proc.stdin.write(draw_target.tobytes())
 
@@ -378,6 +439,22 @@ def _resolve_parameters(
             f"Pass them explicitly, or supply calibration_file."
         )
     return xs, ys, br, bgr, screen
+
+
+def _read_channel_names(calibration_file) -> list[str] | None:
+    """Return the per-PD AI channel names from the calibration JSON, in
+    list order. Returns None if `calibration_file` is None or the JSON
+    has no 'photodiodes' / per-PD 'channel' fields.
+    """
+    if calibration_file is None:
+        return None
+    try:
+        with open(calibration_file) as f:
+            cal = json.load(f)
+    except (OSError, ValueError):
+        return None
+    pds = cal.get("photodiodes") or []
+    return [p.get("channel", "?") for p in pds] or None
 
 
 _ENCODER_CACHE: set[str] | None = None
@@ -578,6 +655,18 @@ def _cli():
              "read from the JSON's monitor.width/height).",
     )
     tag.add_argument(
+        "--sync-bit", dest="sync_bit", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reserve the first PD (PD index 0 in the calibration JSON, "
+             "i.e. the lowest-numbered live AI channel) as an always-on "
+             "'video active' indicator and Gray-encode the frame number "
+             "across the remaining n-1 PDs. Lets the decoder distinguish "
+             "'video off' from 'frame at a multiple of 2**n_bits' (which "
+             "would otherwise both look all-dark). Cycle length is halved. "
+             "Default: enabled. Pass --no-sync-bit to spend all PDs on "
+             "frame bits instead.",
+    )
+    tag.add_argument(
         "--codec", default="libx264",
         help="ffmpeg encoder name. Default 'libx264' (CPU, always works). "
              "Use 'h264_nvenc' or 'hevc_nvenc' for NVIDIA GPU acceleration "
@@ -615,6 +704,7 @@ def _cli():
             bit_xs=args.bit_xs, bit_ys=args.bit_ys,
             bit_radius=args.bit_radius, background_radius=args.background_radius,
             screen_size=tuple(args.screen_size) if args.screen_size else None,
+            sync_bit=args.sync_bit,
             codec=args.codec, preset=args.preset, quality=quality,
             show_progress=args.progress,
         )

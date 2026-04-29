@@ -245,6 +245,18 @@ Selected flags:
   `--background-radius N` -- manual overrides for any of the calibrated
   values. All are in **screen pixel coords** (the same coord system the
   calibration JSON uses), not video-frame coords.
+- `--sync-bit` / `--no-sync-bit` -- whether to reserve the first PD as
+  an always-on "video active" indicator. **Enabled by default.** When
+  on, PD index 0 in the calibration JSON (= the lowest-numbered live
+  AI channel, by physical pin order) is lit on every video frame, and
+  the remaining n-1 PDs Gray-encode the frame number. This lets the
+  decoder cleanly distinguish "video off" (sync dark) from any frame
+  state (sync lit) -- without it, frame numbers at every multiple of
+  2**n_bits encode to all-dark and look identical to "off." Cost: the
+  cycle drops by 2x (16 -> 8 with 4 PDs), so the decoder has to
+  disambiguate cycles from timing more often. The script prints the
+  sync/frame-bit channel assignment at startup so a decoder author can
+  confirm it.
 - `--screen-size WxH` -- screen pixel dimensions of the display the PD
   board is mounted on, e.g. `2400x1600`. Required unless
   `--calibration-file` is given (then read from the JSON's
