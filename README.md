@@ -31,6 +31,7 @@ Hardware/
   Monitorio_v1.1/          v1.1 (4 photodiodes, OPA4323 quad TIA, RJ45 out)
 Source/
   add_video_sync_tags.py   CLI: tag a video with sync circles
+  decode.py                Python module: recover video frame # per DAQ sample
   calibration/             Python package for the calibration pipeline
     daq.py                 NI-DAQmx wrapper
     display.py             pygame-ce fullscreen drawing primitives
@@ -89,7 +90,8 @@ Driver and OS-level tools (install separately, **not** via pip):
   required for `nidaqmx` to talk to any DAQ device. Windows builds are
   the most-tested target; Linux builds are also available from NI.
 - **ffmpeg** (and `ffprobe`) -- must be on `PATH`. The video tagging
-  script shells out to ffmpeg for decoding/encoding.
+  script shells out to ffmpeg for decoding/encoding; the decoder uses
+  ffprobe to read fps and frame count from the tagged video.
 - **Python 3.12+** -- developed against 3.14. Any 3.12+ should work.
 
 Python packages (install with `pip install -r requirements.txt` inside
@@ -125,11 +127,12 @@ a virtualenv):
 3. **Display** the tagged video on the calibrated rig and **record**
    the photodiode channels on the DAQ alongside whatever else the
    experiment is sampling.
-4. **Decode** the DAQ trace: threshold each channel against its
-   per-channel midpoint (from the calibration JSON), Gray-decode, and
-   you have frame number per DAQ sample. (Decoder is the consumer's
-   responsibility -- the calibration JSON contains everything needed:
-   per-PD baselines, channel order, and the cycle length when wrapping.)
+4. **Decode** the DAQ trace with `Source/decode.py` (see "decode.py
+   reference" below): pass in the recorded `(n_channels, n_samples)`
+   array, the tagged video path, and the calibration JSON; get back a
+   table of `(frame_number, sample_index)` rows. The decoder reads the
+   tagger's `<output_video>.tags.json` sidecar to get the sync-bit
+   setting and channel-to-bit assignment automatically.
 
 
 ## Quick start
@@ -284,6 +287,80 @@ Selected flags:
   file. Mapped to `-crf` for libx264 and `-cq` for NVENC. Default 18
   is perceptually lossless on both.
 - `--progress` -- per-frame progress.
+
+
+## `decode.py` reference
+
+After recording the photodiode signals on a DAQ alongside whatever else
+the experiment is sampling, `Source/decode.py` recovers the mapping
+between video frame number and DAQ sample index.
+
+The repo deliberately doesn't include code for parsing your specific
+DAQ's file format -- load the samples into a numpy array however you
+like, then call:
+
+```python
+from decode import decode_sync_tags
+
+result = decode_sync_tags(
+    samples,                           # (n_channels, n_samples) array
+    sample_rate=50_000,                # Hz
+    video_path="exp01_tagged.mp4",     # the tagger's output
+    calibration_path="cal.json",       # the calibration JSON
+    scale="intan_aux",                 # samples are Intan ADC steps
+                                       #   ('volts', 'intan_aux',
+                                       #   'intan_supply', etc., or a
+                                       #   numeric multiplier)
+    output_path="exp01_frames.csv",    # CSV table to write
+    metadata="2026-04-30 rig A trial 7",
+)
+# result.frame_table is an (n_frames, 2) int64 array of
+#   (frame_number, sample_index) rows.
+```
+
+The tagger writes a sidecar `<output_video>.tags.json` next to its
+output that records the sync-bit setting and channel-to-bit assignment;
+the decoder reads it automatically. Pass `sync_bit_override=True/False`
+to force a value (useful if the sidecar is missing or wrong).
+
+The decoder operates in **strict mode**: it assumes the recording
+contains exactly one complete video playback bracketed by "video off"
+padding on both sides, and raises `RuntimeError` otherwise. Specifically
+it errors out if:
+
+- No bimodal signal is detected on the sync-bit channel (or any channel
+  in `--no-sync-bit` mode) -- recording probably has no video, the
+  channel order doesn't match calibration, or the scale factor produced
+  near-constant voltages.
+- More than one video segment is detected (chunk the recording yourself
+  before passing it in).
+- The first decoded frame doesn't match Gray-code value 1 (segment
+  doesn't start at frame 1, recording is partial, or threshold/debounce
+  picked the wrong first transition).
+- The decoded total frame count doesn't match the source video's frame
+  count to within ±1 (recording truncated, or unwrap miscounted).
+
+Softer issues land in `result.warnings_` (and the CSV's `# warning:`
+header lines): per-channel threshold drift vs. calibration, individual
+dropped frames recovered via timing, etc.
+
+The internal bimodal threshold is found per channel via Otsu's method
+on the recording itself, with the calibration JSON's
+`baseline_dark_v` / `baseline_bright_v` used only as a sanity check.
+This makes the decoder unit-agnostic given the right `scale`: NI DAQ
+records in volts (`scale="volts"` or `1.0`); Intan auxiliary input
+channels record raw ADC steps that convert to volts at
+`0.0000374 V/step` (`scale="intan_aux"`). The `SCALE_PRESETS` dict in
+`decode.py` lists the available shorthand names. Also be aware that
+the Intan aux input ranges only ~0 to 2.45 V -- verify the PD signal
+doesn't clip at the top of that range.
+
+The CSV output has a `#`-prefixed header carrying the source video
+path, calibration path, sample rate, fps, sync-bit setting, cycle,
+per-channel detected thresholds, segment bounds, the `metadata` string
+the user passed in, and any warnings. Two data columns:
+`frame_number,sample_index`. `frame_number` is 1-indexed; `sample_index`
+is into the original `samples` array.
 
 
 ## Smoke tests
