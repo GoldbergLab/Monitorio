@@ -243,10 +243,20 @@ Selected flags:
   `--terminal-config` to the subprocess.
 - `--bit-xs A,B,C`, `--bit-ys A,B,C`, `--bit-radius N`,
   `--background-radius N` -- manual overrides for any of the calibrated
-  values.
-- `--enlarged-size WxH` -- pad the input frame with black to a larger
-  canvas before drawing tags. Useful when the video's native size
-  doesn't reach the PD positions on the rig's display.
+  values. All are in **screen pixel coords** (the same coord system the
+  calibration JSON uses), not video-frame coords.
+- `--screen-size WxH` -- screen pixel dimensions of the display the PD
+  board is mounted on, e.g. `2400x1600`. Required unless
+  `--calibration-file` is given (then read from the JSON's
+  `monitor.width/height`). The output video is rendered at whatever size
+  preserves the screen aspect ratio with **minimal padding** around the
+  input (no upscaling, no cropping); tag positions and radii are scaled
+  by `output_w / screen_w` so they land at the correct screen pixels
+  when the output is shown full-screen on this display. The script
+  errors out if the input is larger than the screen in either dimension
+  (cropping would lose content), and warns if the scaled tag radius
+  drops below ~3 px (likely too small to read reliably -- use a larger
+  input video).
 - `--codec NAME` -- ffmpeg encoder. Defaults to `libx264` (CPU; always
   works). On a machine with an NVIDIA GPU and an ffmpeg build linked
   against the NVIDIA SDK, `--codec h264_nvenc` (or `hevc_nvenc`) is

@@ -4,10 +4,33 @@ Python port of addVideoSyncTags.m. Uses ffmpeg (must be on PATH) for
 video I/O so no heavy Python video library is required; numpy does the
 per-frame pixel math.
 
-Each output frame has, at every (bitXs[k], bitYs[k]) position:
-  - a black filled disk of `background_radius` pixels
+Each output frame has, at every screen-coord (bitXs[k], bitYs[k]):
+  - a black filled disk of `background_radius` pixels (in screen px)
   - a white filled disk of `bit_radius` pixels INSIDE the black disk,
     drawn only when bit k of grayEncode(frame_number) is 1.
+
+Coordinate system
+-----------------
+All tag positions and radii are in SCREEN pixel coordinates -- i.e. they
+match what the calibration tool measured on the physical display the PD
+board is mounted on. The output video is rendered at whatever resolution
+preserves the screen aspect ratio with minimal padding around the input
+(no upscaling, no cropping). Tag coords are then scaled by
+`output_w / screen_w` to land at the correct screen pixels when the
+output is shown full-screen on the calibrated display.
+
+Concretely: if you calibrated on a 2400x1600 screen and feed in a
+1920x1080 video, the output is padded to 2400x1620 (16:9 -> 3:2),
+scale=1.0, tags drawn at the JSON's screen pixel coords. If you instead
+feed a 1200x800 video (already 3:2), no pad is needed; output is
+1200x800, scale=0.5, tags shrink and shift correspondingly. Either way
+the output displays correctly when shown full-screen on the calibrated
+display.
+
+The screen size MUST be supplied (via the calibration JSON's
+`monitor.width/height`, or via the `screen_size` argument); without it
+the scale factor is undefined. The input video must not be larger than
+the screen in either dimension (no cropping).
 
 Frame numbers are 1-indexed (frame 1 is the first output frame) so the
 encoding round-trips cleanly with any decoder expecting MATLAB-style
@@ -27,9 +50,10 @@ i.e. all bits off, which is visually indistinguishable from an
 unillumated tag area; downstream code should tolerate that case.
 
 Parameter resolution for each of bit_xs / bit_ys / bit_radius /
-background_radius:
+background_radius / screen_size:
     1. Value passed explicitly to add_video_sync_tags() wins.
-    2. Otherwise, if calibration_file is given, its value is used.
+    2. Otherwise, if calibration_file is given, its value is used
+       (screen_size from the JSON's monitor.width/height).
     3. Otherwise, this function errors -- there's no safe default
        because sensible values depend on the specific Monitorio board +
        monitor combination.
@@ -38,7 +62,8 @@ CLI usage:
     python add_video_sync_tags.py IN.mp4 OUT.mp4 --calibration-file cal.json
     python add_video_sync_tags.py IN.mp4 OUT.mp4 \\
         --bit-xs 31,88,145,202 --bit-ys 40 \\
-        --bit-radius 20 --background-radius 35
+        --bit-radius 20 --background-radius 35 \\
+        --screen-size 2400x1600
 """
 
 from __future__ import annotations
@@ -66,7 +91,7 @@ def add_video_sync_tags(
     bit_ys=None,
     bit_radius: int | None = None,
     background_radius: int | None = None,
-    enlarged_size: tuple[int, int] | None = None,
+    screen_size: tuple[int, int] | None = None,
     codec: str = "libx264",
     preset: str | None = None,
     quality: int = 18,
@@ -76,6 +101,12 @@ def add_video_sync_tags(
 
     Returns the number of frames written.
 
+    screen_size: (width, height) in pixels of the physical display the PD
+             board is mounted on. Tag positions and radii are interpreted
+             as screen pixel coords and scaled to the output frame so
+             that the output displays correctly when shown full-screen
+             on this display. Read from the calibration JSON's
+             monitor.width/height when not given explicitly.
     codec:   ffmpeg encoder name. 'libx264' (default, CPU) is always
              available. 'h264_nvenc' uses NVIDIA NVENC; ~5-10x faster
              on supported GPUs but requires both an NVENC-capable card
@@ -94,9 +125,11 @@ def add_video_sync_tags(
     if not video_in.exists():
         raise FileNotFoundError(video_in)
 
-    xs, ys, bit_r, bg_r = _resolve_parameters(
+    xs, ys, bit_r, bg_r, screen = _resolve_parameters(
         calibration_file, bit_xs, bit_ys, bit_radius, background_radius,
+        screen_size,
     )
+    screen_w, screen_h = screen
     n_bits = max(len(xs), len(ys))
     if len(xs) == 1:
         xs = np.tile(xs, n_bits)
@@ -112,30 +145,70 @@ def add_video_sync_tags(
     info = _probe_video(video_in)
     w, h, fps, n_frames = info["width"], info["height"], info["fps"], info["n_frames"]
 
-    if enlarged_size is not None:
-        out_w, out_h = int(enlarged_size[0]), int(enlarged_size[1])
-        if out_w < w or out_h < h:
-            raise ValueError(
-                f"enlarged_size ({out_w}x{out_h}) is smaller than input ({w}x{h})"
-            )
-        pad_left = (out_w - w) // 2
-        pad_top = (out_h - h) // 2
+    if w > screen_w or h > screen_h:
+        raise ValueError(
+            f"input video ({w}x{h}) is larger than the calibrated screen "
+            f"({screen_w}x{screen_h}) in at least one dimension. Cropping "
+            f"would lose content; resize the video down first."
+        )
+
+    # Pad input minimally to match screen aspect ratio; output is then any
+    # resolution with screen_w/screen_h aspect, no upscale, no crop. The
+    # axis with the larger ratio of (screen / input) is the one we leave
+    # untouched -- the other axis gets black-bar padding.
+    if w * screen_h >= h * screen_w:
+        # Input is wider than (or equal to) screen in aspect: pad height.
+        out_w = w
+        out_h = int(round(w * screen_h / screen_w))
     else:
-        out_w, out_h = w, h
-        pad_left = 0
-        pad_top = 0
+        # Input is taller than screen in aspect: pad width.
+        out_h = h
+        out_w = int(round(h * screen_w / screen_h))
+    pad_left = (out_w - w) // 2
+    pad_top = (out_h - h) // 2
+    needs_pad = (out_w != w) or (out_h != h)
+
+    # Map screen-pixel coords -> output-frame coords. Both axes scale by
+    # the same factor since out has matching aspect ratio.
+    scale = out_w / screen_w
+    scaled_xs = [int(round(float(x) * scale)) for x in xs]
+    scaled_ys = [int(round(float(y) * scale)) for y in ys]
+    scaled_bit_r = max(1, int(round(bit_r * scale)))
+    scaled_bg_r = max(1, int(round(bg_r * scale)))
+
+    if scaled_bit_r < 3:
+        # The white bit circle has to be readable by the photodiode after
+        # the screen scales the output back up. <3 px in the output frame
+        # is so small it's likely to alias / disappear into pixel grid.
+        print(
+            f"  warning: scaled bit radius is {scaled_bit_r} px (screen "
+            f"radius {bit_r}, scale {scale:.3f}); may be too small to "
+            f"read reliably. Consider feeding a larger input video.",
+            file=sys.stderr,
+        )
 
     # Precompute per-bit disk masks (bounding box + boolean mask); they
     # never change frame to frame, so doing it once saves a meshgrid per
     # frame per bit.
     bg_masks = [
-        _disk_mask(int(x) + pad_left, int(y) + pad_top, bg_r, out_w, out_h)
-        for x, y in zip(xs, ys)
+        _disk_mask(x, y, scaled_bg_r, out_w, out_h)
+        for x, y in zip(scaled_xs, scaled_ys)
     ]
     bit_masks = [
-        _disk_mask(int(x) + pad_left, int(y) + pad_top, bit_r, out_w, out_h)
-        for x, y in zip(xs, ys)
+        _disk_mask(x, y, scaled_bit_r, out_w, out_h)
+        for x, y in zip(scaled_xs, scaled_ys)
     ]
+    if any(m is None for m in bg_masks) or any(m is None for m in bit_masks):
+        offscreen = [
+            (i, scaled_xs[i], scaled_ys[i])
+            for i, m in enumerate(bg_masks) if m is None
+        ]
+        print(
+            f"  warning: tag(s) at output coords {offscreen} fall entirely "
+            f"outside the {out_w}x{out_h} output frame and won't be drawn. "
+            f"Check that the calibration screen size matches the rig.",
+            file=sys.stderr,
+        )
 
     if n_frames is not None and n_frames >= cycle:
         # Wrapping is supported by design (with limited PDs you usually have
@@ -195,11 +268,11 @@ def add_video_sync_tags(
     )
 
     frame_bytes = w * h * 3
-    # Reusable output buffer when enlarging; otherwise we modify a fresh
+    # Reusable output buffer when padding; otherwise we modify a fresh
     # copy of each input frame.
     out_frame = (
         np.zeros((out_h, out_w, 3), dtype=np.uint8)
-        if enlarged_size is not None
+        if needs_pad
         else None
     )
 
@@ -211,7 +284,7 @@ def add_video_sync_tags(
                 break
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3)
 
-            if enlarged_size is not None:
+            if needs_pad:
                 out_frame[:] = 0
                 out_frame[pad_top:pad_top + h, pad_left:pad_left + w] = frame
                 draw_target = out_frame
@@ -266,8 +339,10 @@ def add_video_sync_tags(
 
 # ----- internals ------------------------------------------------------
 
-def _resolve_parameters(calibration_file, bit_xs, bit_ys, bit_radius, background_radius):
-    cal_xs = cal_ys = cal_br = cal_bgr = None
+def _resolve_parameters(
+    calibration_file, bit_xs, bit_ys, bit_radius, background_radius, screen_size,
+):
+    cal_xs = cal_ys = cal_br = cal_bgr = cal_screen = None
     if calibration_file is not None:
         with open(calibration_file) as f:
             cal = json.load(f)
@@ -278,23 +353,31 @@ def _resolve_parameters(calibration_file, bit_xs, bit_ys, bit_radius, background
         cal_ys = np.array([int(round(p["y_px"])) for p in pds])
         cal_br = int(max(p["bit_radius_px"] for p in pds))
         cal_bgr = int(max(p["background_radius_px"] for p in pds))
+        monitor = cal.get("monitor") or {}
+        if "width" in monitor and "height" in monitor:
+            cal_screen = (int(monitor["width"]), int(monitor["height"]))
 
     xs = np.asarray(bit_xs, dtype=np.int64) if bit_xs is not None else cal_xs
     ys = np.asarray(bit_ys, dtype=np.int64) if bit_ys is not None else cal_ys
     br = int(bit_radius) if bit_radius is not None else cal_br
     bgr = int(background_radius) if background_radius is not None else cal_bgr
+    screen = (
+        (int(screen_size[0]), int(screen_size[1]))
+        if screen_size is not None else cal_screen
+    )
 
     missing = []
     if xs is None: missing.append("bit_xs")
     if ys is None: missing.append("bit_ys")
     if br is None: missing.append("bit_radius")
     if bgr is None: missing.append("background_radius")
+    if screen is None: missing.append("screen_size")
     if missing:
         raise ValueError(
             f"Missing required value(s): {', '.join(missing)}. "
             f"Pass them explicitly, or supply calibration_file."
         )
-    return xs, ys, br, bgr
+    return xs, ys, br, bgr, screen
 
 
 _ENCODER_CACHE: set[str] | None = None
@@ -486,8 +569,13 @@ def _cli():
 
     tag = p.add_argument_group("tagging options")
     tag.add_argument(
-        "--enlarged-size", dest="enlarged_size", type=_csv_ints, default=None,
-        help="output dimensions WxH (e.g. 1920x1080) if input should be padded",
+        "--screen-size", dest="screen_size", type=_csv_ints, default=None,
+        help="screen pixel dimensions WxH (e.g. 2400x1600) of the display "
+             "the PD board is mounted on. Tag positions and radii are in "
+             "screen pixels and get scaled to the output frame so the "
+             "result displays correctly when shown full-screen on this "
+             "screen. Required unless --calibration-file is given (then "
+             "read from the JSON's monitor.width/height).",
     )
     tag.add_argument(
         "--codec", default="libx264",
@@ -526,7 +614,7 @@ def _cli():
             calibration_file=calibration_file,
             bit_xs=args.bit_xs, bit_ys=args.bit_ys,
             bit_radius=args.bit_radius, background_radius=args.background_radius,
-            enlarged_size=tuple(args.enlarged_size) if args.enlarged_size else None,
+            screen_size=tuple(args.screen_size) if args.screen_size else None,
             codec=args.codec, preset=args.preset, quality=quality,
             show_progress=args.progress,
         )
