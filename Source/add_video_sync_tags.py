@@ -96,6 +96,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -395,6 +396,39 @@ def add_video_sync_tags(
     if write_rc not in (0, None):
         err = write_proc.stderr.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"ffmpeg (write) exited with {write_rc}:\n{err}")
+
+    # Write the sidecar manifest <video_out>.tags.json so the decoder can
+    # recover sync-bit setting + per-bit channel assignment without the
+    # operator having to hand-pass them. Best-effort: a write failure is
+    # logged but doesn't kill the tagging run that already succeeded.
+    sidecar_path = video_out.with_suffix(video_out.suffix + ".tags.json")
+    sidecar = {
+        "schema_version": 1,
+        "tagged_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "input_video": str(video_in),
+        "output_video": str(video_out),
+        "calibration_file": str(calibration_file) if calibration_file else None,
+        "fps": float(fps),
+        "n_frames_written": int(frames_written),
+        "screen_size": [int(screen_w), int(screen_h)],
+        "output_size": [int(out_w), int(out_h)],
+        "sync_bit": bool(sync_bit),
+        "n_pds": int(n_pds),
+        "n_frame_bits": int(n_frame_bits),
+        "cycle": int(cycle),
+        "channel_assignment": {
+            "sync": (cal_channels[sync_idx] if cal_channels and sync_idx is not None else None),
+            "frame_bits": [
+                (cal_channels[i] if cal_channels else f"PD#{i}")
+                for i in frame_bit_idx
+            ],
+        },
+    }
+    try:
+        sidecar_path.write_text(json.dumps(sidecar, indent=2))
+    except OSError as e:
+        print(f"  warning: could not write sidecar {sidecar_path}: {e}",
+              file=sys.stderr)
     return frames_written
 
 
