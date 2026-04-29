@@ -441,6 +441,28 @@ def _decode_core(
                 f"unrecoverable when there's no timing slack)."
             )
 
+    # Measured frame rate cross-check: time per frame as observed in the
+    # recording must agree with the ffprobed nominal fps. A mismatch
+    # points at a wrong DAQ sample_rate, a wrong fps in the video's
+    # header, or a different display refresh rate than the encoded fps.
+    if len(rows) >= 2:
+        first_sample = rows[0][1]
+        last_sample = rows[-1][1]
+        n_intervals = len(rows) - 1
+        duration_s = (last_sample - first_sample) / sample_rate
+        if duration_s > 0:
+            measured_fps = n_intervals / duration_s
+            rel_err = abs(measured_fps - fps) / fps
+            if rel_err > 0.01:  # >1% discrepancy
+                warnings_.append(
+                    f"measured fps from frame timing ({measured_fps:.4f} Hz) "
+                    f"disagrees with the video's declared fps ({fps:.4f} Hz) "
+                    f"by {rel_err:.1%}. Check that sample_rate ({sample_rate} "
+                    f"Hz) matches the DAQ used for the recording, that the "
+                    f"video was played at its native fps, and that the "
+                    f"display refresh rate matches the video fps."
+                )
+
     frame_table = (
         np.array(rows, dtype=np.int64) if rows
         else np.empty((0, 2), dtype=np.int64)

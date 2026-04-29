@@ -276,6 +276,34 @@ def test_csv_header_includes_provenance_and_metadata(tmp_path):
 
 
 @requires_ffmpeg
+def test_measured_fps_mismatch_warning(tmp_path):
+    # Tag a 30 fps video, then claim the DAQ ran at 25 kHz when really
+    # the synthetic samples were laid out at 50 kHz (ratio of 2x). The
+    # decoder will see frame intervals half as long as expected and the
+    # measured fps will be ~60 Hz instead of 30. The strict "decoded
+    # count == expected count" check still passes (the bit pattern is
+    # right), but the timing cross-check should warn.
+    cal = _make_cal(tmp_path)
+    vout = _tag_video(tmp_path, cal, sync_bit=True)
+    samples, _ = _build_recording(sync_bit=True)
+    # Pass half the true sample_rate -> measured fps doubles.
+    result = decode_sync_tags(samples, SAMPLE_RATE / 2, vout, cal)
+    assert any("measured fps" in w for w in result.warnings_), (
+        f"expected an fps-mismatch warning, got: {result.warnings_}"
+    )
+
+
+@requires_ffmpeg
+def test_measured_fps_matches_no_warning(tmp_path):
+    # Sanity: when sample_rate is correct, no fps warning is emitted.
+    cal = _make_cal(tmp_path)
+    vout = _tag_video(tmp_path, cal, sync_bit=True)
+    samples, _ = _build_recording(sync_bit=True)
+    result = decode_sync_tags(samples, SAMPLE_RATE, vout, cal)
+    assert not any("measured fps" in w for w in result.warnings_)
+
+
+@requires_ffmpeg
 def test_threshold_drift_warning(tmp_path):
     # Build a recording whose voltages are wildly different from the
     # calibration baselines (e.g. someone forgot the scale factor).
