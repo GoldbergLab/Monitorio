@@ -15,6 +15,17 @@ indexing. Sync tags are Gray-coded: at most one bit changes between
 consecutive frames, so a photodiode decoder that samples mid-transition
 can only ever be off by +-1, never misread a wildly different value.
 
+If the video has more frames than n_bits sync tags can uniquely encode
+(2**n_bits, e.g. 16 for n_bits=4), the encoded frame number wraps:
+frame 1, 2, ..., 2**n_bits, 1, 2, ... The reflected-binary Gray code
+preserves the "exactly one bit changes per step" property across the
+wrap, including the wrap edge itself (gray(2**n_bits - 1) and gray(0)
+also differ in only one bit). The decoder is responsible for resolving
+which cycle each frame belongs to (typically using its sample
+timestamp). Note that frame 2**n_bits, 2*2**n_bits, ... map to gray(0),
+i.e. all bits off, which is visually indistinguishable from an
+unillumated tag area; downstream code should tolerate that case.
+
 Parameter resolution for each of bit_xs / bit_ys / bit_radius /
 background_radius:
     1. Value passed explicitly to add_video_sync_tags() wins.
@@ -81,7 +92,7 @@ def add_video_sync_tags(
             f"bit_xs and bit_ys must be broadcast-compatible: "
             f"got len(bit_xs)={len(xs)}, len(bit_ys)={len(ys)}"
         )
-    max_frame = (1 << n_bits) - 1  # grayEncode maps [0, 2^n) -> [0, 2^n)
+    cycle = 1 << n_bits  # grayEncode maps [0, 2**n) -> [0, 2**n) bijectively
 
     info = _probe_video(video_in)
     w, h, fps, n_frames = info["width"], info["height"], info["fps"], info["n_frames"]
@@ -111,10 +122,16 @@ def add_video_sync_tags(
         for x, y in zip(xs, ys)
     ]
 
-    if n_frames is not None and n_frames > max_frame:
-        raise ValueError(
-            f"Video has {n_frames} frames but {n_bits} Gray-coded sync tags "
-            f"can only uniquely encode frames 1..{max_frame}. Add more tags."
+    if n_frames is not None and n_frames >= cycle:
+        # Wrapping is supported by design (with limited PDs you usually have
+        # to), but warn so a user who didn't realize they were wrapping isn't
+        # surprised when their decoder sees repeated codes.
+        n_cycles = n_frames / cycle
+        print(
+            f"  note: {n_frames} frames > 2**{n_bits} = {cycle}; "
+            f"frame number will wrap {n_cycles:.1f} times. Decoder must "
+            f"disambiguate cycles via timestamp.",
+            file=sys.stderr,
         )
 
     # ffmpeg read: decode video-only rgb24 stream to stdout.
@@ -171,12 +188,11 @@ def add_video_sync_tags(
                 draw_target = frame.copy()
 
             frames_written += 1
-            g = int(gray.encode(np.int64(frames_written)))
-            if g > max_frame:
-                raise RuntimeError(
-                    f"grayEncode({frames_written}) = {g} overflows "
-                    f"{n_bits}-bit sync tag array"
-                )
+            # Wrap modulo cycle so videos longer than 2**n_bits frames keep
+            # encoding cleanly; gray() over a full [0, 2**n_bits) cycle has
+            # the single-bit-change property at every step including the
+            # wrap edge.
+            g = int(gray.encode(np.int64(frames_written % cycle)))
 
             # Always-on black backgrounds.
             for m in bg_masks:
