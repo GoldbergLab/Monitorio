@@ -114,7 +114,15 @@ class DAQ:
         self._sample_rate = float(sample_rate)
         self._voltage_range = voltage_range
         self._terminal_config = terminal_config
-        self._all_channels = tuple(c.name for c in self._device.ai_physical_chans)
+        # Physical channels usable in this terminal config. In DIFF/PSEUDO_DIFF
+        # only half the AI pins are addressable as separate channels (the rest
+        # are reserved as their negative-input partners), so we filter by the
+        # device's own self-reported per-channel ai_term_cfgs rather than
+        # assuming all pins map to all configs.
+        self._all_channels = tuple(
+            c.name for c in self._device.ai_physical_chans
+            if terminal_config in c.ai_term_cfgs
+        )
 
     @property
     def device_name(self) -> str:
@@ -288,10 +296,26 @@ def list_devices() -> list[str]:
     return [d.name for d in System.local().devices]
 
 
-def list_ai_channels(device_name: str) -> list[str]:
-    """Return every AI physical channel name on the named device."""
+def list_ai_channels(
+    device_name: str,
+    *,
+    terminal_config: TerminalConfiguration | None = None,
+) -> list[str]:
+    """Return AI physical channel names on the named device.
+
+    If `terminal_config` is given, only channels that support that
+    configuration are returned. This matters in DIFF (and PSEUDO_DIFF):
+    half the physical AI pins are not addressable as separate channels
+    in those modes -- they're reserved as the negative-input partners of
+    the other half. On a 32-pin X-series device, RSE/NRSE return all 32;
+    DIFF returns 16 (the positive-input pins). The exact pinout is
+    device-dependent, so we ask the device itself rather than assuming.
+    """
     dev = System.local().devices[device_name]
-    return [c.name for c in dev.ai_physical_chans]
+    chans = list(dev.ai_physical_chans)
+    if terminal_config is not None:
+        chans = [c for c in chans if terminal_config in c.ai_term_cfgs]
+    return [c.name for c in chans]
 
 
 # CLI-friendly names for the nidaqmx TerminalConfiguration enum. Excludes

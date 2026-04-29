@@ -200,14 +200,17 @@ def main() -> int:
         return 1
 
     device_name = args.device if args.device is not None else devices[0]
-    chans = list_ai_channels(device_name)[:10]
+    tc = terminal_config_from_name(args.terminal_config)
+    # Filter by terminal config: in DIFF mode the device only exposes half its
+    # AI pins as addressable channels, so we must query usable channels under
+    # the chosen config rather than blindly taking the first 10 physical pins.
+    chans = list_ai_channels(device_name, terminal_config=tc)[:10]
 
     output_path = Path(
         args.output or f"calibration_{time.strftime('%Y%m%d-%H%M%S')}.json"
     )
 
     # --- Hardware phase: measure everything. -------------------------
-    tc = terminal_config_from_name(args.terminal_config)
     print(f"Terminal config: {args.terminal_config}")
     with DAQ(device_name, terminal_config=tc) as daq:
         with Display(args.display) as display:
