@@ -66,8 +66,13 @@ def _make_cal(tmp_path: Path) -> Path:
     return cal
 
 
-def _tag_video(tmp_path: Path, cal: Path, *, sync_bit: bool = True) -> Path:
-    vin = make_video(tmp_path / "in.mp4", SCREEN_W, SCREEN_H, duration=1, fps=int(FPS))
+def _tag_video(
+    tmp_path: Path, cal: Path, *, sync_bit: bool = True, n_frames: int = N_FRAMES,
+) -> Path:
+    duration = n_frames / FPS
+    vin = make_video(
+        tmp_path / "in.mp4", SCREEN_W, SCREEN_H, duration=duration, fps=int(FPS),
+    )
     vout = tmp_path / ("out_sync.mp4" if sync_bit else "out_no_sync.mp4")
     sync_flag = "--sync-bit" if sync_bit else "--no-sync-bit"
     subprocess.run(
@@ -301,6 +306,76 @@ def test_measured_fps_matches_no_warning(tmp_path):
     samples, _ = _build_recording(sync_bit=True)
     result = decode_sync_tags(samples, SAMPLE_RATE, vout, cal)
     assert not any("measured fps" in w for w in result.warnings_)
+
+
+@requires_ffmpeg
+def test_no_sync_bit_last_frame_all_zeros_synthesized(tmp_path):
+    # In --no-sync-bit mode with cycle=16, a video whose frame count is
+    # a multiple of 16 has its last frame Gray-encode to all-zeros --
+    # indistinguishable from the post-video "off" pad. The decoder
+    # should detect this case, synthesize the last frame at the nominal
+    # interval, and emit a clear warning naming --sync-bit as the fix.
+    cal = _make_cal(tmp_path)
+    n_frames = 16  # exactly one cycle
+    vout = _tag_video(tmp_path, cal, sync_bit=False, n_frames=n_frames)
+    samples_per_frame = SAMPLE_RATE / FPS
+    rng = np.random.default_rng(7)
+    n_total = N_OFF_SAMPLES + int(round(n_frames * samples_per_frame)) + N_OFF_SAMPLES
+    ch = np.full((4, n_total), DARK_V, dtype=np.float64)
+    ch += rng.normal(0, 0.005, ch.shape)
+    expected_starts = []
+    for f in range(1, n_frames + 1):
+        s0 = N_OFF_SAMPLES + int(round((f - 1) * samples_per_frame))
+        s1 = N_OFF_SAMPLES + int(round(f * samples_per_frame))
+        expected_starts.append(s0)
+        g = int(gray.encode(np.int64(f % 16)))
+        for k in range(4):
+            if (g >> k) & 1:
+                ch[k, s0:s1] = BRIGHT_V + rng.normal(0, 0.005, s1 - s0)
+
+    result = decode_sync_tags(ch, SAMPLE_RATE, vout, cal)
+    # Synthesized last frame brings the total back up to n_frames.
+    assert result.frame_table.shape == (n_frames, 2)
+    assert int(result.frame_table[-1, 0]) == n_frames
+    # And the warning explains what happened.
+    assert any(
+        "Gray-encodes to all zeros" in w and "--sync-bit" in w
+        for w in result.warnings_
+    ), f"expected ambiguity warning, got: {result.warnings_}"
+    # Synthesized sample index is at last_real + nominal_interval --
+    # within ±1 sample of the true frame start.
+    last_real_sample = int(result.frame_table[-2, 1])
+    synth_sample = int(result.frame_table[-1, 1])
+    assert synth_sample == last_real_sample + int(round(SAMPLE_RATE / FPS))
+    # Sanity: prior frames still align exactly.
+    for j in range(n_frames - 1):
+        assert int(result.frame_table[j, 1]) == expected_starts[j]
+
+
+@requires_ffmpeg
+def test_sync_bit_last_frame_all_zeros_no_ambiguity(tmp_path):
+    # Sanity: with --sync-bit on, the same exact-cycle situation has no
+    # ambiguity because the sync bit stays lit on the all-zeros frame.
+    cal = _make_cal(tmp_path)
+    n_frames = 8  # exactly one cycle in sync-bit mode
+    vout = _tag_video(tmp_path, cal, sync_bit=True, n_frames=n_frames)
+    samples_per_frame = SAMPLE_RATE / FPS
+    rng = np.random.default_rng(8)
+    n_total = N_OFF_SAMPLES + int(round(n_frames * samples_per_frame)) + N_OFF_SAMPLES
+    ch = np.full((4, n_total), DARK_V, dtype=np.float64)
+    ch += rng.normal(0, 0.005, ch.shape)
+    for f in range(1, n_frames + 1):
+        s0 = N_OFF_SAMPLES + int(round((f - 1) * samples_per_frame))
+        s1 = N_OFF_SAMPLES + int(round(f * samples_per_frame))
+        ch[0, s0:s1] = BRIGHT_V + rng.normal(0, 0.005, s1 - s0)
+        g = int(gray.encode(np.int64(f % 8)))
+        for k in range(3):
+            if (g >> k) & 1:
+                ch[k + 1, s0:s1] = BRIGHT_V + rng.normal(0, 0.005, s1 - s0)
+    result = decode_sync_tags(ch, SAMPLE_RATE, vout, cal)
+    assert result.frame_table.shape == (n_frames, 2)
+    # No "Gray-encodes to all zeros" warning -- sync bit kept it visible.
+    assert not any("all zeros" in w for w in result.warnings_)
 
 
 @requires_ffmpeg

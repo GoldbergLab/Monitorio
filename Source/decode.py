@@ -428,17 +428,44 @@ def _decode_core(
         for j in range(len(frame_start_offsets))
     ]
 
-    # Recording-level check: decoded frame count must match the source
-    # video's frame count (within ±1 for the rare boundary rounding case).
+    # Recording-level check: decoded frame count vs. the source video's
+    # frame count.
     if expected_n_frames is not None:
         decoded_total = int(absolute[-1])
-        if abs(decoded_total - expected_n_frames) > 1:
+        diff = expected_n_frames - decoded_total
+        samples_per_frame_nominal = sample_rate / fps
+        if not sync_bit and diff == 1 and expected_n_frames % cycle == 0:
+            # Specific ambiguity unique to --no-sync-bit mode: the last
+            # frame Gray-encodes to all zeros (frame number is a multiple
+            # of the cycle), so it's indistinguishable from the
+            # post-video "off" period in the recording. The user has
+            # guaranteed the recording brackets a complete video, so we
+            # synthesize the missing last frame at the nominal interval
+            # past the last detected frame and warn explicitly.
+            synth_sample = int(rows[-1][1] + round(samples_per_frame_nominal))
+            rows.append((expected_n_frames, synth_sample))
+            warnings_.append(
+                f"in --no-sync-bit mode, frame {expected_n_frames} "
+                f"Gray-encodes to all zeros and is indistinguishable from "
+                f"the post-video 'off' period; synthesized its sample "
+                f"index ({synth_sample}) as last detected sample + "
+                f"sample_rate/fps. Re-tag with --sync-bit to remove the "
+                f"ambiguity."
+            )
+        elif abs(diff) > 1:
             raise RuntimeError(
                 f"decoded {decoded_total} frames but the source video has "
                 f"{expected_n_frames}. The recording is either truncated, "
                 f"missing the trailing video-off pad, or the unwrap is "
                 f"miscounting (dropped frames near the end can be "
                 f"unrecoverable when there's no timing slack)."
+            )
+        elif diff != 0:
+            warnings_.append(
+                f"decoded {decoded_total} frames but the source video has "
+                f"{expected_n_frames} (off by {diff:+d}). Likely a single "
+                f"dropped frame near the end of the recording, or a "
+                f"boundary-rounding artifact in the segment detection."
             )
 
     # Measured frame rate cross-check: time per frame as observed in the

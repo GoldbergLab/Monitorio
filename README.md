@@ -342,7 +342,18 @@ it errors out if:
 
 Softer issues land in `result.warnings_` (and the CSV's `# warning:`
 header lines): per-channel threshold drift vs. calibration, individual
-dropped frames recovered via timing, etc.
+dropped frames recovered via timing, fps mismatch between the recording
+and the video file's metadata, etc.
+
+Specific case worth flagging in **--no-sync-bit mode**: if the video's
+total frame count is an exact multiple of `2**n_pds` (i.e. the cycle
+length), the very last frame Gray-encodes to all zeros and is
+indistinguishable from the post-video "off" period. The decoder
+detects this, synthesizes the missing last frame at
+`last_real_sample + sample_rate/fps`, and emits a clear warning
+suggesting `--sync-bit` to remove the ambiguity. With `--sync-bit`
+on (the default) this can never happen since the sync PD is lit on
+every video frame.
 
 The internal bimodal threshold is found per channel via Otsu's method
 on the recording itself, with the calibration JSON's
