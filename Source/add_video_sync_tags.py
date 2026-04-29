@@ -67,12 +67,27 @@ def add_video_sync_tags(
     bit_radius: int | None = None,
     background_radius: int | None = None,
     enlarged_size: tuple[int, int] | None = None,
-    crf: int = 18,
+    codec: str = "libx264",
+    preset: str | None = None,
+    quality: int = 18,
     show_progress: bool = False,
 ) -> int:
     """Write `video_out` = `video_in` with Gray-coded sync-tag overlays.
 
     Returns the number of frames written.
+
+    codec:   ffmpeg encoder name. 'libx264' (default, CPU) is always
+             available. 'h264_nvenc' uses NVIDIA NVENC; ~5-10x faster
+             on supported GPUs but requires both an NVENC-capable card
+             and an ffmpeg build linked against the NVIDIA SDK. Other
+             codec names (hevc_nvenc, etc.) are passed through to
+             ffmpeg unchanged.
+    preset:  encoder preset. Defaults are codec-dependent: 'veryfast'
+             for libx264, 'p4' (medium) for *_nvenc. Pass any preset
+             string ffmpeg's encoder accepts.
+    quality: visual-quality knob. For libx264 it's mapped to -crf;
+             for *_nvenc it's mapped to -cq. 18 is "perceptually
+             indistinguishable from source" for both encoders.
     """
     video_in = Path(video_in)
     video_out = Path(video_out)
@@ -134,6 +149,23 @@ def add_video_sync_tags(
             file=sys.stderr,
         )
 
+    # Validate the chosen encoder up front so the user gets a clear error
+    # instead of cryptic ffmpeg output if their build doesn't include it.
+    if not _ffmpeg_has_encoder(codec):
+        raise RuntimeError(
+            f"ffmpeg on PATH does not list encoder {codec!r}. Available "
+            f"encoders can be inspected with `ffmpeg -encoders`. NVENC "
+            f"requires an NVIDIA GPU with an NVENC engine and an ffmpeg "
+            f"build linked against the NVIDIA SDK; fall back to "
+            f"--codec libx264 if NVENC isn't available."
+        )
+
+    is_nvenc = codec.endswith("_nvenc")
+    eff_preset = preset if preset is not None else ("p4" if is_nvenc else "veryfast")
+    quality_args = (
+        ["-cq", str(int(quality))] if is_nvenc else ["-crf", str(int(quality))]
+    )
+
     # ffmpeg read: decode video-only rgb24 stream to stdout.
     read_cmd = [
         "ffmpeg", "-loglevel", "error", "-i", str(video_in),
@@ -141,7 +173,7 @@ def add_video_sync_tags(
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
     # ffmpeg write: take raw rgb24 from stdin (video), re-open input for
-    # audio if present, mux into H.264 + original audio.
+    # audio if present, mux video + original audio.
     write_cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -149,7 +181,8 @@ def add_video_sync_tags(
         "-i", "-",
         "-i", str(video_in),
         "-map", "0:v:0", "-map", "1:a?",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(int(crf)),
+        "-c:v", codec, "-preset", eff_preset, "-pix_fmt", "yuv420p",
+        *quality_args,
         "-c:a", "copy",
         str(video_out),
     ]
@@ -262,6 +295,36 @@ def _resolve_parameters(calibration_file, bit_xs, bit_ys, bit_radius, background
             f"Pass them explicitly, or supply calibration_file."
         )
     return xs, ys, br, bgr
+
+
+_ENCODER_CACHE: set[str] | None = None
+
+
+def _ffmpeg_has_encoder(name: str) -> bool:
+    """Return True iff `ffmpeg -encoders` lists an encoder of the given name.
+
+    Caches the parsed encoder set on first call; subsequent checks are
+    free. Does NOT verify that the encoder will actually run on this
+    machine (NVENC may be listed but the GPU/driver may reject it at
+    runtime). Catches the common "ffmpeg build missing the encoder
+    entirely" case up front; remaining failures will surface as ffmpeg
+    errors during the real encode.
+    """
+    global _ENCODER_CACHE
+    if _ENCODER_CACHE is None:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, check=False,
+        )
+        names = set()
+        for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+            # Lines after the header look like:
+            #   ' V....D libx264              libx264 H.264 ...'
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("V"):
+                names.add(parts[1])
+        _ENCODER_CACHE = names
+    return name in _ENCODER_CACHE
 
 
 def _probe_video(path: Path) -> dict:
@@ -427,14 +490,35 @@ def _cli():
         help="output dimensions WxH (e.g. 1920x1080) if input should be padded",
     )
     tag.add_argument(
-        "--crf", type=int, default=18,
-        help="libx264 CRF (lower = higher quality, larger file). Default 18.",
+        "--codec", default="libx264",
+        help="ffmpeg encoder name. Default 'libx264' (CPU, always works). "
+             "Use 'h264_nvenc' or 'hevc_nvenc' for NVIDIA GPU acceleration "
+             "(typically 5-10x faster on supported GPUs); requires both an "
+             "NVENC-capable card and an ffmpeg build with NVIDIA SDK support.",
+    )
+    tag.add_argument(
+        "--preset", default=None,
+        help="encoder preset string. Default depends on codec: 'veryfast' "
+             "for libx264, 'p4' for NVENC. Pass any preset the chosen "
+             "encoder accepts.",
+    )
+    tag.add_argument(
+        "--quality", type=int, default=18,
+        help="visual quality knob (lower = higher quality). Mapped to "
+             "-crf for libx264, -cq for NVENC. Default 18 is perceptually "
+             "lossless on both.",
+    )
+    tag.add_argument(
+        "--crf", type=int, default=None,
+        help=argparse.SUPPRESS,  # legacy alias for --quality
     )
     tag.add_argument("--progress", action="store_true", help="print per-frame progress")
     args = p.parse_args()
 
     if args.calibrate and args.calibration_file:
         p.error("--calibrate and --calibration-file are mutually exclusive")
+
+    quality = args.crf if args.crf is not None else args.quality
 
     def _tag(calibration_file: str | None) -> None:
         n = add_video_sync_tags(
@@ -443,7 +527,8 @@ def _cli():
             bit_xs=args.bit_xs, bit_ys=args.bit_ys,
             bit_radius=args.bit_radius, background_radius=args.background_radius,
             enlarged_size=tuple(args.enlarged_size) if args.enlarged_size else None,
-            crf=args.crf, show_progress=args.progress,
+            codec=args.codec, preset=args.preset, quality=quality,
+            show_progress=args.progress,
         )
         print(f"wrote {n} frames to {args.video_out}")
 

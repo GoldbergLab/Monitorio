@@ -247,7 +247,20 @@ Selected flags:
 - `--enlarged-size WxH` -- pad the input frame with black to a larger
   canvas before drawing tags. Useful when the video's native size
   doesn't reach the PD positions on the rig's display.
-- `--crf N` -- libx264 quality knob; lower = larger files, default 18.
+- `--codec NAME` -- ffmpeg encoder. Defaults to `libx264` (CPU; always
+  works). On a machine with an NVIDIA GPU and an ffmpeg build linked
+  against the NVIDIA SDK, `--codec h264_nvenc` (or `hevc_nvenc`) is
+  typically 5-10x faster. The script does a build-level check at
+  startup and errors out if the encoder isn't compiled in; runtime
+  failures (e.g. ffmpeg has the encoder but the GPU isn't supported)
+  surface as an ffmpeg error during the encode -- if that happens,
+  fall back to the default.
+- `--preset NAME` -- encoder preset. Defaults are codec-dependent:
+  `veryfast` for libx264, `p4` (medium) for NVENC. Pass any preset
+  string the chosen encoder accepts.
+- `--quality N` -- visual-quality knob; lower = higher quality, larger
+  file. Mapped to `-crf` for libx264 and `-cq` for NVENC. Default 18
+  is perceptually lossless on both.
 - `--progress` -- per-frame progress.
 
 
