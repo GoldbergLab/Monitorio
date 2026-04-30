@@ -33,7 +33,7 @@ import pytest
 
 from calibration import gray
 from conftest import make_calibration_json, make_video, requires_ffmpeg
-from decode import SCALE_PRESETS, decode_sync_tags
+from decode_sync_tags import SCALE_PRESETS, decode_sync_tags
 
 SCRIPT = Path(__file__).resolve().parent.parent / "Source" / "add_video_sync_tags.py"
 

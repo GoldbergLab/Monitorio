@@ -31,7 +31,9 @@ Hardware/
   Monitorio_v1.1/          v1.1 (4 photodiodes, OPA4323 quad TIA, RJ45 out)
 Source/
   add_video_sync_tags.py   CLI: tag a video with sync circles
-  decode.py                Python module: recover video frame # per DAQ sample
+  decode_sync_tags.py      Python module: recover video frame # per DAQ sample
+  decodeSyncTags.m         MATLAB wrapper around decode_sync_tags.py
+  setupMonitorioPython.m   MATLAB helper: pyenv setup against the repo venv
   calibration/             Python package for the calibration pipeline
     daq.py                 NI-DAQmx wrapper
     display.py             pygame-ce fullscreen drawing primitives
@@ -127,8 +129,8 @@ a virtualenv):
 3. **Display** the tagged video on the calibrated rig and **record**
    the photodiode channels on the DAQ alongside whatever else the
    experiment is sampling.
-4. **Decode** the DAQ trace with `Source/decode.py` (see "decode.py
-   reference" below): pass in the recorded `(n_channels, n_samples)`
+4. **Decode** the DAQ trace with `Source/decode_sync_tags.py` (see
+   "`decode_sync_tags.py` reference" below): pass in the recorded `(n_channels, n_samples)`
    array, the tagged video path, and the calibration JSON; get back a
    table of `(frame_number, sample_index)` rows. The decoder reads the
    tagger's `<output_video>.tags.json` sidecar to get the sync-bit
@@ -289,10 +291,10 @@ Selected flags:
 - `--progress` -- per-frame progress.
 
 
-## `decode.py` reference
+## `decode_sync_tags.py` reference
 
 After recording the photodiode signals on a DAQ alongside whatever else
-the experiment is sampling, `Source/decode.py` recovers the mapping
+the experiment is sampling, `Source/decode_sync_tags.py` recovers the mapping
 between video frame number and DAQ sample index.
 
 The repo deliberately doesn't include code for parsing your specific
@@ -300,7 +302,7 @@ DAQ's file format -- load the samples into a numpy array however you
 like, then call:
 
 ```python
-from decode import decode_sync_tags
+from decode_sync_tags import decode_sync_tags
 
 result = decode_sync_tags(
     samples,                           # (n_channels, n_samples) array
@@ -371,7 +373,7 @@ This makes the decoder unit-agnostic given the right `scale`: NI DAQ
 records in volts (`scale="volts"` or `1.0`); Intan auxiliary input
 channels record raw ADC steps that convert to volts at
 `0.0000374 V/step` (`scale="intan_aux"`). The `SCALE_PRESETS` dict in
-`decode.py` lists the available shorthand names. Also be aware that
+`decode_sync_tags.py` lists the available shorthand names. Also be aware that
 the Intan aux input ranges only ~0 to 2.45 V -- verify the PD signal
 doesn't clip at the top of that range.
 
@@ -381,6 +383,57 @@ per-channel detected thresholds, segment bounds, the `metadata` string
 the user passed in, and any warnings. Two data columns:
 `frame_number,sample_index`. `frame_number` is 1-indexed; `sample_index`
 is into the original `samples` array.
+
+
+## MATLAB wrapper
+
+`Source/decodeSyncTags.m` calls the Python decoder from MATLAB via
+MATLAB's [Python Interface](https://www.mathworks.com/help/matlab/call-python-libraries.html).
+`Source/setupMonitorioPython.m` configures `pyenv` to point at the
+repo's `venv` (auto-discovered alongside the script) in
+`OutOfProcess` mode.
+
+Setup -- once per MATLAB session, BEFORE any other Python calls:
+
+```matlab
+addpath('path/to/Monitorio/Source');
+setupMonitorioPython();
+```
+
+Then call `decodeSyncTags` like the Python function:
+
+```matlab
+% NI-DAQmx recording (already in volts):
+result = decodeSyncTags(samples, 50000, 'tagged.mp4', 'cal.json');
+
+% Intan recording (raw aux-input ADC steps):
+result = decodeSyncTags(samples, 30000, 'tagged.mp4', 'cal.json', ...
+    'Scale', 'intan_aux', ...
+    'OutputPath', 'frames.csv', ...
+    'Metadata', 'rig A trial 7', ...
+    'Verbose', 1);
+
+% frameTable is N-by-2 double; columns are 1-indexed frame_number and
+% 0-indexed sample_index (matches Python). Add 1 if you want a
+% MATLAB-style 1-based sample index.
+sampleIndex1Based = result.frameTable(:, 2) + 1;
+```
+
+`samples` must be `n_channels`-by-`n_samples` with channels in the
+same order as the calibration JSON's photodiode list (= physical AI
+pin order). Channel order, sync-bit setting, and per-bit channel
+assignment are all read from the tagger's `<video>.tags.json` sidecar
+automatically.
+
+If you need to use a venv at a different path:
+
+```matlab
+setupMonitorioPython('VenvPath', 'C:\path\to\some\other\venv');
+```
+
+`pyenv` cannot be reconfigured after Python has been loaded in a
+session, so if you previously imported a different Python from MATLAB,
+restart MATLAB before re-running setup.
 
 
 ## Smoke tests
