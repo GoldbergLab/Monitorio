@@ -67,19 +67,21 @@ def _make_cal(tmp_path: Path) -> Path:
 
 
 def _tag_video(
-    tmp_path: Path, cal: Path, *, sync_bit: bool = True, n_frames: int = N_FRAMES,
+    tmp_path: Path, cal: Path, *,
+    sync_bit: bool = True, n_frames: int = N_FRAMES,
+    pad_for_unambiguous_end: bool = True,
 ) -> Path:
     duration = n_frames / FPS
     vin = make_video(
         tmp_path / "in.mp4", SCREEN_W, SCREEN_H, duration=duration, fps=int(FPS),
     )
     vout = tmp_path / ("out_sync.mp4" if sync_bit else "out_no_sync.mp4")
-    sync_flag = "--sync-bit" if sync_bit else "--no-sync-bit"
-    subprocess.run(
-        [sys.executable, str(SCRIPT), str(vin), str(vout),
-         "--calibration-file", str(cal), sync_flag],
-        capture_output=True, check=True,
-    )
+    cmd = [sys.executable, str(SCRIPT), str(vin), str(vout),
+           "--calibration-file", str(cal),
+           "--sync-bit" if sync_bit else "--no-sync-bit"]
+    if not pad_for_unambiguous_end:
+        cmd.append("--no-pad-for-unambiguous-end")
+    subprocess.run(cmd, capture_output=True, check=True)
     return vout
 
 
@@ -317,7 +319,13 @@ def test_no_sync_bit_last_frame_all_zeros_synthesized(tmp_path):
     # interval, and emit a clear warning naming --sync-bit as the fix.
     cal = _make_cal(tmp_path)
     n_frames = 16  # exactly one cycle
-    vout = _tag_video(tmp_path, cal, sync_bit=False, n_frames=n_frames)
+    # Disable the tagger's padding so we exercise the decoder's
+    # safety-net synthesis path (otherwise the tagger removes the
+    # ambiguity by appending a frame before the decoder ever sees it).
+    vout = _tag_video(
+        tmp_path, cal, sync_bit=False, n_frames=n_frames,
+        pad_for_unambiguous_end=False,
+    )
     samples_per_frame = SAMPLE_RATE / FPS
     rng = np.random.default_rng(7)
     n_total = N_OFF_SAMPLES + int(round(n_frames * samples_per_frame)) + N_OFF_SAMPLES
@@ -350,6 +358,44 @@ def test_no_sync_bit_last_frame_all_zeros_synthesized(tmp_path):
     # Sanity: prior frames still align exactly.
     for j in range(n_frames - 1):
         assert int(result.frame_table[j, 1]) == expected_starts[j]
+
+
+@requires_ffmpeg
+def test_no_sync_bit_padding_eliminates_ambiguity(tmp_path):
+    # Same input video as the safety-net test (16 frames, exact cycle),
+    # but let the tagger pad as it does by default. The output now has
+    # 17 frames (frame 17 = gray(1) = bit 0 lit, distinct from off), so
+    # there's no ambiguity and the decoder produces a clean answer with
+    # no synthesis-warning.
+    cal = _make_cal(tmp_path)
+    n_frames = 16  # exact cycle in source
+    vout = _tag_video(
+        tmp_path, cal, sync_bit=False, n_frames=n_frames,
+        # default: pad_for_unambiguous_end=True
+    )
+    # Sidecar should reflect the padding.
+    sidecar = json.loads((vout.with_suffix(vout.suffix + ".tags.json")).read_text())
+    assert sidecar["padded_frames"] == 1
+    assert sidecar["n_frames_written"] == n_frames + 1
+
+    # Build a recording matching the PADDED 17-frame output.
+    samples_per_frame = SAMPLE_RATE / FPS
+    rng = np.random.default_rng(11)
+    n_total = N_OFF_SAMPLES + int(round((n_frames + 1) * samples_per_frame)) + N_OFF_SAMPLES
+    ch = np.full((4, n_total), DARK_V, dtype=np.float64)
+    ch += rng.normal(0, 0.005, ch.shape)
+    for f in range(1, n_frames + 1 + 1):  # frames 1..17
+        s0 = N_OFF_SAMPLES + int(round((f - 1) * samples_per_frame))
+        s1 = N_OFF_SAMPLES + int(round(f * samples_per_frame))
+        g = int(gray.encode(np.int64(f % 16)))
+        for k in range(4):
+            if (g >> k) & 1:
+                ch[k, s0:s1] = BRIGHT_V + rng.normal(0, 0.005, s1 - s0)
+    result = decode_sync_tags(ch, SAMPLE_RATE, vout, cal)
+    assert result.frame_table.shape == (n_frames + 1, 2)
+    # No ambiguity warning since the tagger pre-empted the all-zeros
+    # last-frame case by padding.
+    assert not any("Gray-encodes to all zeros" in w for w in result.warnings_)
 
 
 @requires_ffmpeg

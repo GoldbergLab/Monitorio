@@ -117,6 +117,7 @@ def add_video_sync_tags(
     background_radius: int | None = None,
     screen_size: tuple[int, int] | None = None,
     sync_bit: bool = True,
+    pad_for_unambiguous_end: bool = True,
     codec: str = "libx264",
     preset: str | None = None,
     quality: int = 18,
@@ -150,6 +151,16 @@ def add_video_sync_tags(
              distinguish "video off" from "frame at a multiple of
              2**n_bits" (which would otherwise both look all-dark).
              Cycle length is halved (2**(n-1) instead of 2**n).
+    pad_for_unambiguous_end: only relevant in --no-sync-bit mode. If the
+             input video's frame count is an exact multiple of the cycle
+             length, its last frame Gray-encodes to all-zeros, which is
+             indistinguishable from the post-video off period in the
+             recording. With this flag on (the default), the tagger
+             appends a single extra black-content frame so the output's
+             length isn't a cycle multiple and no frame falls on the
+             ambiguous all-zeros codeword at the boundary. Has no effect
+             in sync-bit mode (the sync PD is lit on every video frame
+             and removes the ambiguity by construction).
     """
     video_in = Path(video_in)
     video_out = Path(video_out)
@@ -382,6 +393,44 @@ def add_video_sync_tags(
                 else:
                     print(f"\r  frame {frames_written}", end="", flush=True)
 
+        # If we're in --no-sync-bit mode and the input ended on a frame
+        # whose number is a multiple of the cycle, that frame Gray-encoded
+        # to all zeros and is indistinguishable from "video off" in the
+        # recording. Append one extra black-content frame (tagged with
+        # gray((N+1) % cycle), which is gray(1) = bit 0 lit) so the
+        # output's last frame is unambiguously visible. Skipped in
+        # sync-bit mode (the sync PD already disambiguates) and skippable
+        # via pad_for_unambiguous_end=False.
+        padded_frames = 0
+        if (
+            pad_for_unambiguous_end
+            and not sync_bit
+            and frames_written > 0
+            and frames_written % cycle == 0
+        ):
+            pad_target = (
+                out_frame
+                if out_frame is not None
+                else np.zeros((out_h, out_w, 3), dtype=np.uint8)
+            )
+            pad_target[:] = 0
+            for m in bg_masks:
+                _apply_mask(pad_target, m, 0)
+            g = int(gray.encode(np.int64((frames_written + 1) % cycle)))
+            for k in range(n_frame_bits):
+                if (g >> k) & 1:
+                    _apply_mask(pad_target, bit_masks[frame_bit_idx[k]], 255)
+            write_proc.stdin.write(pad_target.tobytes())
+            frames_written += 1
+            padded_frames = 1
+            print(
+                f"  note: appended 1 black padding frame to avoid the "
+                f"all-zeros-last-frame ambiguity (input had {frames_written - 1} "
+                f"frames, a multiple of cycle {cycle}). Disable with "
+                f"pad_for_unambiguous_end=False / --no-pad-for-unambiguous-end.",
+                file=sys.stderr,
+            )
+
         if show_progress:
             print()
     finally:
@@ -410,6 +459,7 @@ def add_video_sync_tags(
         "calibration_file": str(calibration_file) if calibration_file else None,
         "fps": float(fps),
         "n_frames_written": int(frames_written),
+        "padded_frames": int(padded_frames),
         "screen_size": [int(screen_w), int(screen_h)],
         "output_size": [int(out_w), int(out_h)],
         "sync_bit": bool(sync_bit),
@@ -701,6 +751,15 @@ def _cli():
              "frame bits instead.",
     )
     tag.add_argument(
+        "--pad-for-unambiguous-end", dest="pad_for_unambiguous_end",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="only relevant in --no-sync-bit mode. If the input's frame "
+             "count is an exact multiple of the cycle length, append one "
+             "extra black-content frame to the output so the last frame "
+             "isn't on the all-zeros codeword (which would be ambiguous "
+             "with 'video off' in the recording). Default: enabled.",
+    )
+    tag.add_argument(
         "--codec", default="libx264",
         help="ffmpeg encoder name. Default 'libx264' (CPU, always works). "
              "Use 'h264_nvenc' or 'hevc_nvenc' for NVIDIA GPU acceleration "
@@ -739,6 +798,7 @@ def _cli():
             bit_radius=args.bit_radius, background_radius=args.background_radius,
             screen_size=tuple(args.screen_size) if args.screen_size else None,
             sync_bit=args.sync_bit,
+            pad_for_unambiguous_end=args.pad_for_unambiguous_end,
             codec=args.codec, preset=args.preset, quality=quality,
             show_progress=args.progress,
         )

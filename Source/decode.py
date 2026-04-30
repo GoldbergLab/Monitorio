@@ -110,8 +110,16 @@ def decode_sync_tags(
     sync_bit_override: bool | None = None,
     output_path=None,
     metadata: str | None = None,
+    verbose: int = 0,
 ) -> DecodeResult:
-    """High-level decoder: load context from disk, then call the core."""
+    """High-level decoder: load context from disk, then call the core.
+
+    verbose: 0 = silent (default), 1 = top-level decisions printed to
+             stderr (sync-bit source, fps, segment bounds, decoded
+             frame count), 2 = also dumps per-channel thresholds, SNR,
+             and per-transition unwrap accounting. Useful when a real
+             rig's recording isn't decoding the way you expect.
+    """
     samples = np.asarray(samples)
     if samples.ndim != 2:
         raise ValueError(
@@ -182,13 +190,26 @@ def decode_sync_tags(
 
     if sync_bit_override is not None:
         sync_bit = bool(sync_bit_override)
+        sync_source = "explicit override"
     elif sidecar is not None:
         sync_bit = bool(sidecar.get("sync_bit", True))
+        sync_source = f"sidecar {sidecar_path.name}"
     else:
         sync_bit = True
+        sync_source = "default (no sidecar found)"
         print(
             f"  note: no sidecar at {sidecar_path}; assuming sync_bit=True. "
             f"Pass sync_bit_override to force the value if this is wrong.",
+            file=sys.stderr,
+        )
+
+    if verbose >= 1:
+        print(
+            f"[decode] video={video_path.name} fps={fps} "
+            f"expected_n_frames={expected_n_frames} sample_rate={sample_rate} "
+            f"sync_bit={sync_bit} ({sync_source}) "
+            f"scale={scale_value:g} channels={samples_v.shape[0]} "
+            f"samples={samples_v.shape[1]}",
             file=sys.stderr,
         )
 
@@ -201,7 +222,18 @@ def decode_sync_tags(
         cal_bright_v=cal_bright_v,
         debounce_fraction=float(debounce_fraction),
         expected_n_frames=expected_n_frames,
+        verbose=int(verbose),
     )
+
+    if verbose >= 1:
+        print(
+            f"[decode] segment=[{result.segment_start_sample},"
+            f"{result.segment_end_sample}) decoded={result.frame_table.shape[0]} "
+            f"warnings={len(result.warnings_)}",
+            file=sys.stderr,
+        )
+        for w in result.warnings_:
+            print(f"[decode] warning: {w}", file=sys.stderr)
 
     # Optional CSV output. Header carries provenance + per-channel
     # thresholds + the user-supplied metadata string, so a reader can
@@ -231,6 +263,7 @@ def _decode_core(
     cal_bright_v: list[float],
     debounce_fraction: float,
     expected_n_frames: int | None,
+    verbose: int = 0,
 ) -> DecodeResult:
     """Pure-numpy decoder. Takes voltages + all params explicitly."""
     n_channels, n_samples = samples_v.shape
@@ -296,6 +329,18 @@ def _decode_core(
     relevant_channels = (
         [sync_idx_for_check] if sync_bit else list(range(n_channels))
     )
+    if verbose >= 2:
+        print(
+            f"[decode] per-channel thresholds: "
+            f"{[f'{t:.4g}' for t in thresholds]}",
+            file=sys.stderr,
+        )
+        print(
+            f"[decode] per-channel SNR: "
+            f"{[round(s, 2) for s in snr_per_channel]}",
+            file=sys.stderr,
+        )
+
     if all(snr_per_channel[i] < SNR_FLOOR for i in relevant_channels):
         which = (
             f"sync-bit channel (index 0)" if sync_bit
@@ -330,19 +375,33 @@ def _decode_core(
     if sync_bit:
         video_on = binary[sync_idx]
     else:
-        # No sync bit: assume video is on whenever any frame bit is high.
-        # The decoder will still see brief all-dark frames at multiples of
-        # cycle as "off" -- which is exactly the limitation the sync-bit
-        # mode was added to remove. Without sync bit, treat such gaps as
-        # part of a continuous segment if they're shorter than a few
-        # frames; rely on debounce + segment merging.
-        video_on = binary.any(axis=0)
-        # Bridge short False gaps within a segment (multiple of cycle ->
-        # all-dark for one frame): close gaps shorter than 2 frames.
-        bridge_n = max(1, int(round(2 * samples_per_frame)))
-        video_on = ~_debounce_runs(~video_on, bridge_n)
+        # No sync bit: video is on whenever any frame bit is high. Brief
+        # all-dark frames at multiples of cycle would otherwise look like
+        # "video off"; bridge OFF runs shorter than ~1.5 frames so a
+        # single all-zeros frame mid-segment doesn't split the segment in
+        # two. We use a direct fill rather than _debounce_runs because
+        # that helper's direction-aware snap is tailored to per-channel
+        # bit detection, not gap closing -- on a recording whose tail
+        # also has short ON content (e.g. a single padding frame), the
+        # snap rule will swallow it.
+        video_on = binary.any(axis=0).copy()
+        bridge_n = max(1, int(round(1.5 * samples_per_frame)))
+        if video_on.size > 1:
+            sig = video_on.astype(np.int8)
+            diff = np.diff(sig)
+            breaks = np.where(diff != 0)[0] + 1
+            starts = np.concatenate(([0], breaks))
+            ends = np.concatenate((breaks, [video_on.size]))
+            for s, e in zip(starts, ends):
+                if not video_on[s] and (e - s) < bridge_n:
+                    video_on[s:e] = True
 
     segments = _runs_of_true(video_on)
+    if verbose >= 2:
+        print(
+            f"[decode] segments detected: {segments}",
+            file=sys.stderr,
+        )
     if not segments:
         raise RuntimeError(
             "No video segments detected (no sustained 'video on' state). "
@@ -422,6 +481,13 @@ def _decode_core(
             )
         advance = cyclic_advance + k * cycle
         absolute[j] = absolute[j - 1] + advance
+        if verbose >= 2:
+            print(
+                f"[decode]   transition #{j}: cyclic_advance={cyclic_advance} "
+                f"timing_advance={timing_advance} k={k} -> frame "
+                f"{absolute[j]} at sample {start + frame_start_offsets[j]}",
+                file=sys.stderr,
+            )
 
     rows = [
         (int(absolute[j]), int(start + frame_start_offsets[j]))

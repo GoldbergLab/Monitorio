@@ -348,12 +348,21 @@ and the video file's metadata, etc.
 Specific case worth flagging in **--no-sync-bit mode**: if the video's
 total frame count is an exact multiple of `2**n_pds` (i.e. the cycle
 length), the very last frame Gray-encodes to all zeros and is
-indistinguishable from the post-video "off" period. The decoder
-detects this, synthesizes the missing last frame at
-`last_real_sample + sample_rate/fps`, and emits a clear warning
-suggesting `--sync-bit` to remove the ambiguity. With `--sync-bit`
-on (the default) this can never happen since the sync PD is lit on
-every video frame.
+indistinguishable from the post-video "off" period. The tagger handles
+this by default by appending a single black-content frame so the output
+isn't an exact cycle multiple (`--no-pad-for-unambiguous-end` opts
+out); the decoder also has a safety-net that detects the case if it
+slips through, synthesizes the missing last frame at
+`last_real_sample + sample_rate/fps`, and emits a warning suggesting
+`--sync-bit` to remove the ambiguity. With `--sync-bit` on (the
+default) the issue can't arise -- the sync PD is lit on every video
+frame.
+
+Pass `verbose=1` for a one-line summary of decoder decisions
+(input shape, sync-bit source, segment bounds, decoded count) printed
+to stderr; `verbose=2` adds per-channel thresholds, SNR values,
+detected segments, and per-transition unwrap accounting. Useful when a
+real-rig recording isn't decoding the way you expect.
 
 The internal bimodal threshold is found per channel via Otsu's method
 on the recording itself, with the calibration JSON's
