@@ -9,8 +9,7 @@ session except while a video is playing), and loops:
        rejection sampling.
     2. Sleep that long, with the screen kept black.
     3. Pick a random video from the configured list.
-    4. Play it: decode raw RGB frames with ffmpeg, blit each frame
-       into the fullscreen pygame window at the right time.
+    4. Hand it to VLC to play (audio + video, frame-accurate sync).
     5. Append a row to the playback log with wall-clock timestamps.
     6. Repeat until n_plays plays have happened or
        total_session_seconds have elapsed (whichever the config sets).
@@ -24,13 +23,15 @@ from the PD signals.
 Press ESC at any time during playback to abort. Pygame events are
 drained during the IVI sleeps so ESC during a gap also aborts.
 
-Why pygame for the window: it gives us native fullscreen on a chosen
-display index (already used by the calibration tool), no title bar /
-no chrome, no window-open/close animations between plays (the window
-persists; only its contents change), and no extra dependencies. Video
-frames are decoded by a short-lived ffmpeg subprocess pipe (same
-mechanism add_video_sync_tags uses) and blitted into the window via
-pygame.surfarray.
+Architecture: pygame opens a persistent fullscreen black window on the
+chosen monitor. VLC is told to render into pygame's HWND
+(set_hwnd / set_xwindow), so the same window does double duty as
+"black background between plays" (pygame) and "playback surface"
+(VLC). One window for the whole session means no Windows window-
+open/close animations, no chrome to disable per-player. VLC handles
+audio + video sync natively.
+
+Requires: VLC installed system-wide, plus `pip install python-vlc`.
 
 Config (TOML):
 
@@ -69,8 +70,8 @@ import time
 import tomllib
 from pathlib import Path
 
-import numpy as np
 import pygame
+import vlc
 
 
 # ----- config loading -------------------------------------------------
@@ -173,127 +174,131 @@ def _probe_video(path: Path) -> dict:
 # ----- playback (one video) -------------------------------------------
 
 def _play_one(
-    video_path: Path, screen, screen_w: int, screen_h: int,
-    *, info: dict | None = None,
+    video_path: Path, *, vlc_player, vlc_instance, screen,
+    info: dict | None = None,
 ) -> dict:
-    """Decode `video_path` and blit its frames into `screen`.
+    """Hand `video_path` to VLC, wait for it to finish, return diagnostics.
 
-    Returns a dict with playback diagnostics:
-      aborted: True iff user pressed ESC / closed the window.
-      duration: actual wall-clock duration of playback (seconds).
-      frames_shown: how many frames were blitted.
-      expected_frames: ffprobed frame count (None if ffprobe couldn't
-                       determine).
-      expected_duration: expected_frames / fps when known, else None.
-      max_late_ms: worst slip past a frame's nominal display time.
-      n_late_frames: number of frames whose blit was >= 5 ms past
-                     their target time (a rough "the playback fell
-                     behind here" indicator).
-      ffmpeg_returncode: exit status of the decoding ffmpeg process.
-      ffmpeg_stderr: any stderr output from ffmpeg (truncated).
+    `vlc_player` is a pre-configured vlc.MediaPlayer that's already had
+    set_hwnd() (or set_xwindow / set_nsobject) called on the pygame
+    fullscreen window. We just hand it new media, call play(), and
+    poll for the End/Stopped/Error state.
 
-    Frames are scheduled at their nominal interval (1 / fps) measured
-    against a single monotonic anchor at playback start, so any
-    per-frame jitter in the Python loop doesn't accumulate over a long
-    video. If a frame falls behind (rendering can't keep up), we don't
-    sleep negative -- we move on and account for it in max_late_ms /
-    n_late_frames.
+    Returns a dict mirroring the old (pygame-blit-based) implementation
+    so the session-driver status and CSV-log code stays unchanged:
+      aborted, duration, frames_shown, expected_frames,
+      expected_duration, max_late_ms, n_late_frames, vlc_state,
+      vlc_error.
+
+    Note that frames_shown / max_late_ms / n_late_frames don't have the
+    same meaning under VLC as they did under pygame's per-frame loop --
+    VLC handles vsync internally and we don't see per-frame timing.
+    Instead:
+      - frames_shown: estimated as round(duration * fps) (VLC doesn't
+        expose a frame counter on the python-vlc API surface). This is
+        only useful for the CSV log; the decoder's PD-signal-driven
+        frame count is the source of truth.
+      - max_late_ms / n_late_frames: always 0; left in the dict so the
+        CSV columns keep the same meaning across engines (and so a mix
+        of pygame-engine and vlc-engine sessions is still parseable).
     """
     if info is None:
         info = _probe_video(video_path)
-    vw, vh, fps = info["width"], info["height"], info["fps"]
+    fps = info["fps"]
     expected_frames = info.get("n_frames")
-
-    if vw > screen_w or vh > screen_h:
+    vw, vh = info["width"], info["height"]
+    sw, sh = screen.get_size()
+    if vw > sw or vh > sh:
         raise ValueError(
-            f"video {video_path} is {vw}x{vh} but screen is "
-            f"{screen_w}x{screen_h}. Resize the video first; this "
-            f"playback tool only centers, never scales."
+            f"video {video_path} is {vw}x{vh} but screen is {sw}x{sh}. "
+            f"VLC will scale to fit, but it's worth resizing the video "
+            f"first to keep the tagged sync circles at the calibrated "
+            f"screen pixel positions (the tagger preserves screen-pixel "
+            f"placement only when the output matches the screen size)."
         )
-    px = (screen_w - vw) // 2
-    py = (screen_h - vh) // 2
 
-    cmd = [
-        "ffmpeg", "-loglevel", "error", "-i", str(video_path),
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    media = vlc_instance.media_new(str(video_path))
+    # Parsing the media synchronously gets us the duration before play()
+    # so we can detect early-exits.
+    media.parse_with_options(vlc.MediaParseFlag.local, timeout=2000)
+    while media.get_parsed_status() == vlc.MediaParsedStatus.pending:
+        time.sleep(0.01)
+    vlc_player.set_media(media)
 
-    frame_bytes = vw * vh * 3
-    frame_period = 1.0 / fps
-    surf = pygame.Surface((vw, vh))
     aborted = False
-    frames_shown = 0
-    max_late = 0.0
-    n_late = 0
+    err_msg = ""
     t_start = time.perf_counter()
-    try:
-        while True:
-            raw = proc.stdout.read(frame_bytes)
-            if len(raw) < frame_bytes:
+
+    play_rc = vlc_player.play()
+    if play_rc != 0:
+        err_msg = f"vlc_player.play() returned {play_rc}"
+        return {
+            "aborted": False, "duration": 0.0, "frames_shown": 0,
+            "expected_frames": expected_frames,
+            "expected_duration": (expected_frames / fps) if expected_frames else None,
+            "max_late_ms": 0.0, "n_late_frames": 0,
+            "vlc_state": "play_failed",
+            "vlc_error": err_msg,
+        }
+
+    # Wait for VLC to leave the Opening / Buffering states and start
+    # actually playing, then for it to reach Ended (or Error / Stopped).
+    last_state = None
+    poll = 0.020  # 20 ms poll cadence
+    grace_until = time.perf_counter() + 5.0  # seconds for VLC to start
+    while True:
+        state = vlc_player.get_state()
+        if state == vlc.State.Ended:
+            break
+        if state == vlc.State.Stopped:
+            # Either we (or someone else) stopped it, or it never started.
+            break
+        if state == vlc.State.Error:
+            err_msg = f"vlc reached Error state at t={time.perf_counter() - t_start:.2f}s"
+            break
+
+        # Drain pygame events so ESC / window-close still abort.
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                aborted = True
                 break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(vh, vw, 3)
-            # pygame.surfarray uses (W, H, 3) axis order.
-            pygame.surfarray.blit_array(surf, frame.transpose(1, 0, 2))
-            screen.fill((0, 0, 0))
-            screen.blit(surf, (px, py))
-
-            target = t_start + frames_shown * frame_period
-            now = time.perf_counter()
-            slip = now - target
-            if slip > 0:
-                # Behind schedule. Track but don't sleep negative.
-                if slip > max_late:
-                    max_late = slip
-                if slip > 0.005:
-                    n_late += 1
-            else:
-                time.sleep(-slip)  # i.e. sleep(target - now)
-            pygame.display.flip()
-
-            # Drain events; ESC or window-close aborts.
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    aborted = True
-                    break
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    aborted = True
-                    break
-            if aborted:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                aborted = True
                 break
+        if aborted:
+            vlc_player.stop()
+            break
 
-            frames_shown += 1
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+        # If VLC never actually starts, give up.
+        if state in (vlc.State.NothingSpecial, vlc.State.Opening, vlc.State.Buffering):
+            if time.perf_counter() > grace_until:
+                err_msg = f"vlc stuck in {state} after 5 s"
+                vlc_player.stop()
+                break
+        last_state = state
+        time.sleep(poll)
 
     duration = time.perf_counter() - t_start
-    rc = proc.returncode
-    stderr_bytes = b""
-    if proc.stderr is not None:
-        try:
-            stderr_bytes = proc.stderr.read() or b""
-        except (OSError, ValueError):
-            pass
-    stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-    if len(stderr_text) > 500:
-        stderr_text = stderr_text[:500] + "...[truncated]"
+    final_state = vlc_player.get_state()
+    if not err_msg and final_state == vlc.State.Error:
+        err_msg = "vlc final state Error"
+
+    # After the media ends, stop the player and have pygame redraw black
+    # so we go back to a black window for the IVI gap.
+    vlc_player.stop()
+    screen.fill((0, 0, 0))
+    pygame.display.flip()
 
     return {
         "aborted": aborted,
         "duration": duration,
-        "frames_shown": frames_shown,
+        "frames_shown": int(round(duration * fps)) if duration > 0 else 0,
         "expected_frames": expected_frames,
         "expected_duration": (expected_frames / fps) if expected_frames else None,
-        "max_late_ms": max_late * 1000.0,
-        "n_late_frames": n_late,
-        "ffmpeg_returncode": rc,
-        "ffmpeg_stderr": stderr_text,
+        "max_late_ms": 0.0,
+        "n_late_frames": 0,
+        "vlc_state": str(final_state).rsplit(".", 1)[-1],
+        "vlc_error": err_msg,
     }
 
 
@@ -355,8 +360,10 @@ def run_session(config_path: Path) -> int:
         except RuntimeError as e:
             raise RuntimeError(f"failed to probe video {v}: {e}") from e
 
-    # Open the persistent fullscreen window. Stays open for the whole
-    # session; we just blit into it as needed.
+    # Open the persistent fullscreen pygame window. Stays open for the
+    # whole session; serves as the persistent "black between plays"
+    # surface AND as VLC's render target during plays (we hand its
+    # HWND to VLC below).
     pygame.display.init()
     sizes = pygame.display.get_desktop_sizes()
     if not (0 <= monitor_idx < len(sizes)):
@@ -377,6 +384,33 @@ def run_session(config_path: Path) -> int:
         pygame.display.flip()
 
     black()
+
+    # Set up VLC and embed its video output into the pygame window.
+    vlc_instance = vlc.Instance(
+        "--no-video-title-show",     # no overlay with the file name
+        "--no-osd",                  # no on-screen display
+        "--no-stats",
+        "--no-snapshot-preview",
+        "--no-keyboard-events",      # we handle ESC via pygame
+        "--no-mouse-events",
+        "--quiet",
+    )
+    vlc_player = vlc_instance.media_player_new()
+    wm = pygame.display.get_wm_info()
+    if sys.platform == "win32":
+        # On Windows pygame's get_wm_info()['window'] is the SDL window
+        # handle, which is the HWND we want.
+        vlc_player.set_hwnd(int(wm["window"]))
+    elif sys.platform.startswith("linux"):
+        vlc_player.set_xwindow(int(wm["window"]))
+    elif sys.platform == "darwin":
+        vlc_player.set_nsobject(int(wm["window"]))
+    else:
+        pygame.display.quit()
+        raise RuntimeError(
+            f"unsupported platform {sys.platform!r}: "
+            f"don't know how to embed VLC video output"
+        )
 
     # --- session-start banner ----------------------------------------
     _say("=" * 64)
@@ -413,8 +447,8 @@ def run_session(config_path: Path) -> int:
             log.write(
                 "play_index,start_time_iso,start_time_unix,"
                 "video_path,duration_seconds,frames_shown,"
-                "expected_frames,ivi_seconds,aborted,n_late_frames,"
-                "max_late_ms,ffmpeg_returncode\n"
+                "expected_frames,ivi_seconds,aborted,"
+                "vlc_state,vlc_error\n"
             )
             log.flush()
 
@@ -464,7 +498,9 @@ def run_session(config_path: Path) -> int:
                 play_failure_msg = ""
                 try:
                     res = _play_one(
-                        video, screen, sw, sh, info=info,
+                        video, vlc_player=vlc_player,
+                        vlc_instance=vlc_instance, screen=screen,
+                        info=info,
                     )
                 except Exception as e:
                     play_failed = True
@@ -474,48 +510,38 @@ def run_session(config_path: Path) -> int:
                         "expected_frames": info.get("n_frames"),
                         "expected_duration": None,
                         "max_late_ms": 0.0, "n_late_frames": 0,
-                        "ffmpeg_returncode": -1,
-                        "ffmpeg_stderr": "",
+                        "vlc_state": "exception",
+                        "vlc_error": play_failure_msg,
                     }
                 black()
 
                 # Failure detection + status. Things we flag:
                 # - Python-level exception during playback
-                # - ffmpeg exited with a non-zero code
-                # - Frame count differs significantly from probed count
-                # - Significant slip (lots of late frames)
+                # - VLC reached an Error state instead of Ended
+                # - Duration differs significantly from probed expectation
                 problems = []
                 if play_failed:
                     problems.append(f"exception: {play_failure_msg}")
-                rc = res["ffmpeg_returncode"]
-                if rc not in (0, None):
-                    problems.append(
-                        f"ffmpeg exit {rc}: {res['ffmpeg_stderr'][:200]}"
-                    )
-                exp_frames = res["expected_frames"]
-                if exp_frames is not None and not res["aborted"]:
-                    delta = res["frames_shown"] - exp_frames
-                    if abs(delta) > max(2, int(0.01 * exp_frames)):
+                if res["vlc_error"]:
+                    problems.append(f"vlc: {res['vlc_error']}")
+                exp_dur = res["expected_duration"]
+                if exp_dur is not None and not res["aborted"]:
+                    actual = res["duration"]
+                    if abs(actual - exp_dur) > max(0.2, 0.05 * exp_dur):
                         problems.append(
-                            f"frame count {res['frames_shown']} vs probed "
-                            f"{exp_frames} (off by {delta:+d})"
+                            f"playback duration {actual:.3f}s differs from "
+                            f"probed {exp_dur:.3f}s by more than 5% / 200ms; "
+                            f"VLC may have failed to play through cleanly"
                         )
-                if res["n_late_frames"] > max(5, 0.05 * res["frames_shown"]):
-                    problems.append(
-                        f"{res['n_late_frames']} of {res['frames_shown']} "
-                        f"frames slipped past their target time "
-                        f"(max {res['max_late_ms']:.1f} ms late)"
-                    )
 
                 # Per-play summary line.
                 tag = "ABORTED" if res["aborted"] else (
                     "FAILED" if problems else "ok"
                 )
                 _say(
-                    f"[{progress}] {tag}: {res['frames_shown']} frames "
-                    f"in {res['duration']:.3f} s "
-                    f"(target {(res['expected_duration'] or 0):.3f} s, "
-                    f"max slip {res['max_late_ms']:.1f} ms)"
+                    f"[{progress}] {tag}: {res['duration']:.3f} s elapsed "
+                    f"(target {(exp_dur or 0):.3f} s, vlc state: "
+                    f"{res['vlc_state']})"
                 )
                 for p in problems:
                     _say(f"  ! {p}")
@@ -527,10 +553,10 @@ def run_session(config_path: Path) -> int:
                 log.write(
                     f"{plays_done + 1},{t0_iso},{t0_unix:.6f},"
                     f"{video},{res['duration']:.6f},{res['frames_shown']},"
-                    f"{exp_frames if exp_frames is not None else ''},"
+                    f"{res['expected_frames'] if res['expected_frames'] is not None else ''},"
                     f"{ivi:.4f},{str(res['aborted']).lower()},"
-                    f"{res['n_late_frames']},{res['max_late_ms']:.3f},"
-                    f"{rc if rc is not None else ''}\n"
+                    f"{res['vlc_state']},"
+                    f"{json.dumps(res['vlc_error']) if res['vlc_error'] else ''}\n"
                 )
                 log.flush()
                 plays_done += 1

@@ -12,3 +12,8 @@ numpy>=1.26
 nidaqmx>=1.0
 
 matplotlib>=3.8
+
+# Random-playback session driver (Source/playback/play_random.py)
+# wraps libvlc. Requires VLC media player installed system-wide
+# (https://www.videolan.org/) -- python-vlc is just the bindings.
+python-vlc>=3.0

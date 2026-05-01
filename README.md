@@ -95,7 +95,13 @@ Driver and OS-level tools (install separately, **not** via pip):
   the most-tested target; Linux builds are also available from NI.
 - **ffmpeg** (and `ffprobe`) -- must be on `PATH`. The video tagging
   script shells out to ffmpeg for decoding/encoding; the decoder uses
-  ffprobe to read fps and frame count from the tagged video.
+  ffprobe to read fps and frame count from the tagged video; the
+  playback script also probes videos with ffprobe.
+- **VLC media player** (https://www.videolan.org/) -- required only
+  for the random-playback session driver
+  (`Source/playback/play_random.py`). The `python-vlc` Python package
+  is just the bindings; the actual VLC binary needs to be installed
+  separately. Skip this if you don't use the playback driver.
 - **Python 3.12+** -- developed against 3.14. Any 3.12+ should work.
 
 Python packages (install with `pip install -r requirements.txt` inside
@@ -451,11 +457,16 @@ restart MATLAB before re-running setup.
 tagged videos with exponentially-distributed inter-video intervals,
 intended to drive the experimental rig while the DAQ records
 continuously. A single fullscreen pygame window opens on the chosen
-monitor and stays black for the entire session, with video frames
-blitted into it during plays -- so there's no per-play window
-open/close animation, no title bar, no chrome. Each play is logged to
-a CSV with wall-clock timestamps so the analyst can chunk the
-recording into per-play windows for the decoder.
+monitor and stays black for the entire session; VLC is told to
+render its video output into the pygame window's HWND, so the same
+window does double-duty as "black between plays" (pygame) and "video
+playback surface" (VLC). One persistent window for the whole
+session means no per-play window open/close animations, no title
+bar, no chrome -- and VLC handles audio + video sync natively. Each
+play is logged to a CSV with wall-clock timestamps so the analyst
+can chunk the recording into per-play windows for the decoder.
+
+Requires VLC installed system-wide; see "Software requirements".
 
 ```bash
 venv/Scripts/python Source/playback/play_random.py CONFIG.toml
