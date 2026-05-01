@@ -30,9 +30,12 @@ n_plays = 50
 monitor_index = 1
 
 [output]
-# Where to write the playback log. Created on first run, appended
-# thereafter (so resuming a session keeps history). Relative to the
-# config file's directory.
+# Base path for the per-session playback log. The actual log filename
+# inserts a UTC timestamp (YYYYMMDDTHHMMSS) between the stem and the
+# extension, so each run gets its own file -- e.g. with the value
+# below, a session started 2026-05-01 23:00 UTC writes to
+# "playback_log_20260501T230000.csv". Relative to the config file's
+# directory.
 log_path = "playback_log.csv"
 
 [random]

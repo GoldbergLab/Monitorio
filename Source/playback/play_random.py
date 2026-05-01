@@ -399,26 +399,34 @@ def _git_short_hash() -> str | None:
     return None
 
 
+def _timestamped_log_path(base: Path, started_at: datetime.datetime) -> Path:
+    """Compute the per-session log filename from a base path + start time.
+
+    Insert YYYYMMDDTHHMMSS between the base path's stem and its
+    extension. If the base path has no extension, use ``.csv``. Avoids
+    colons because Windows forbids them in filenames.
+    """
+    ts = started_at.strftime("%Y%m%dT%H%M%S")
+    if base.suffix:
+        return base.with_name(f"{base.stem}_{ts}{base.suffix}")
+    return base.with_name(f"{base.name}_{ts}.csv")
+
+
 def _write_session_header(
-    log, config_path: Path, config_text: str, *,
-    started_iso: str, n_sessions_so_far: int,
+    log, config_path: Path, config_text: str, *, started_iso: str,
 ) -> None:
-    """Write a `#`-prefixed banner + full config snapshot at session start.
+    """Write a `#`-prefixed banner + full config snapshot at log start.
 
     Standard CSV readers (pandas `comment='#'`, `csv.reader` with a
-    manual filter) skip these lines. Each session emits its own banner,
-    so a log appended over multiple sessions still records which
-    config produced which rows. The config text is the raw bytes of
-    the .toml as-loaded plus a short SHA-256 hash, so even small
-    edits between runs (whitespace, comments) are detectable.
+    manual filter) skip these lines. The config text is the raw bytes
+    of the .toml as-loaded plus a short SHA-256 hash so any drift
+    between runs (whitespace, comments) is detectable.
     """
     config_hash = hashlib.sha256(config_text.encode("utf-8")).hexdigest()[:12]
     git_hash = _git_short_hash() or "(not a git checkout)"
     sep = "# " + "-" * 70
     log.write(sep + "\n")
-    log.write(
-        f"# Monitorio playback session #{n_sessions_so_far + 1} on this log file\n"
-    )
+    log.write(f"# Monitorio playback session\n")
     log.write(f"# session_started_utc: {started_iso}\n")
     log.write(f"# config_path:         {config_path}\n")
     log.write(f"# config_sha256_12:    {config_hash}\n")
@@ -426,27 +434,10 @@ def _write_session_header(
     log.write(f"# python:              {sys.version.split()[0]} ({sys.platform})\n")
     log.write("# --- begin config file snapshot ---\n")
     for line in config_text.splitlines():
-        # Prefix every config line with "# " so it's a CSV comment.
         log.write(f"#   {line}\n")
     log.write("# --- end config file snapshot ---\n")
     log.write(sep + "\n")
     log.flush()
-
-
-def _count_existing_sessions(log_path: Path) -> int:
-    """Count how many '# Monitorio playback session #N' banners are already
-    in `log_path`, so the new session can number itself sequentially."""
-    if not log_path.exists():
-        return 0
-    n = 0
-    try:
-        with log_path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if line.startswith("# Monitorio playback session #"):
-                    n += 1
-    except OSError:
-        pass
-    return n
 
 
 def run_session(config_path: Path) -> int:
@@ -535,6 +526,25 @@ def run_session(config_path: Path) -> int:
             f"don't know how to embed VLC video output"
         )
 
+    config_text = config_path.read_text(encoding="utf-8")
+    session_started_at = datetime.datetime.now(datetime.timezone.utc)
+    session_started_iso = session_started_at.isoformat(timespec="seconds")
+    # One log file per session, with a UTC timestamp in the filename.
+    # The config's `output.log_path` is treated as a base path -- we
+    # insert YYYYMMDDTHHMMSS between its stem and extension. So a
+    # config saying log_path = "playback_log.csv" produces
+    # "playback_log_20260501T230000.csv" for a session starting at
+    # 23:00 UTC on 2026-05-01.
+    log_path = _timestamped_log_path(log_path, session_started_at)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if log_path.exists():
+        # Same-second collision (humans triggering sessions almost
+        # never hit this; defensive only).
+        raise FileExistsError(
+            f"per-session log {log_path} already exists -- wait a second "
+            f"and try again, or pick a different output.log_path."
+        )
+
     # --- session-start banner ----------------------------------------
     _say("=" * 64)
     _say(f"Monitorio random playback session")
@@ -562,31 +572,18 @@ def run_session(config_path: Path) -> int:
     _say(f"  seed:        {seed if seed is not None else '(random)'}")
     _say(f"  press ESC during playback or IVI to abort cleanly.")
     _say("=" * 64)
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    new_log = not log_path.exists() or log_path.stat().st_size == 0
-    config_text = config_path.read_text(encoding="utf-8")
-    n_existing_sessions = _count_existing_sessions(log_path)
-    session_started_iso = datetime.datetime.now(
-        datetime.timezone.utc,
-    ).isoformat(timespec="seconds")
-    with log_path.open("a", encoding="utf-8") as log:
-        if not new_log:
-            # Visual gap between appended sessions in the same log.
-            log.write("\n")
+    with log_path.open("w", encoding="utf-8") as log:
         _write_session_header(
             log, config_path, config_text,
             started_iso=session_started_iso,
-            n_sessions_so_far=n_existing_sessions,
         )
-        if new_log:
-            log.write(
-                "play_index,start_time_iso,start_time_unix,"
-                "video_path,duration_seconds,frames_shown,"
-                "expected_frames,ivi_seconds,aborted,"
-                "vlc_state,vlc_error\n"
-            )
-            log.flush()
+        log.write(
+            "play_index,start_time_iso,start_time_unix,"
+            "video_path,duration_seconds,frames_shown,"
+            "expected_frames,ivi_seconds,aborted,"
+            "vlc_state,vlc_error\n"
+        )
+        log.flush()
 
         session_start = time.perf_counter()
         plays_done = 0
