@@ -238,13 +238,23 @@ def _play_one(
     expected_frames = info.get("n_frames")
     vw, vh = info["width"], info["height"]
     sw, sh = screen.get_size()
-    if vw > sw or vh > sh:
-        raise ValueError(
-            f"video {video_path} is {vw}x{vh} but screen is {sw}x{sh}. "
-            f"VLC will scale to fit, but it's worth resizing the video "
-            f"first to keep the tagged sync circles at the calibrated "
-            f"screen pixel positions (the tagger preserves screen-pixel "
-            f"placement only when the output matches the screen size)."
+    if vw != sw or vh != sh:
+        # VLC will scale to fit the window. That's fine for casual
+        # testing and produces a watchable playback, but the tagger
+        # places the sync circles at SCREEN pixel coordinates: any
+        # scaling moves them off the calibrated photodiode positions
+        # so a recording with this playback won't decode correctly.
+        # Warn (don't raise) so an operator running play_random as a
+        # smoke test on a different display can still see videos
+        # play.
+        print(
+            f"  warning: video {video_path.name} is {vw}x{vh} but the "
+            f"playback window is {sw}x{sh}; VLC will scale. The tagged "
+            f"sync circles won't land at their calibrated screen-pixel "
+            f"positions, so a Monitorio recording made with this "
+            f"playback won't decode correctly. Resize the video to "
+            f"match the screen for actual experiments.",
+            file=sys.stderr,
         )
 
     media = vlc_instance.media_new(str(video_path))
