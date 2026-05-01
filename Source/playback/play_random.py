@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import random
 import subprocess
@@ -367,6 +368,87 @@ def _say(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _git_short_hash() -> str | None:
+    """Short git commit of the script's checkout, or None if unavailable.
+
+    Doesn't fail the session if git isn't installed or the script isn't
+    in a git checkout; just returns None in those cases. Lets the log
+    point at the exact code version that ran, so a stale checkout
+    doesn't silently change behavior.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if proc.returncode == 0:
+            out = proc.stdout.strip()
+            if out:
+                # also flag dirty working tree
+                dirty = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(Path(__file__).resolve().parent),
+                    capture_output=True, text=True, timeout=2, check=False,
+                )
+                if dirty.returncode == 0 and dirty.stdout.strip():
+                    out += "-dirty"
+                return out
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _write_session_header(
+    log, config_path: Path, config_text: str, *,
+    started_iso: str, n_sessions_so_far: int,
+) -> None:
+    """Write a `#`-prefixed banner + full config snapshot at session start.
+
+    Standard CSV readers (pandas `comment='#'`, `csv.reader` with a
+    manual filter) skip these lines. Each session emits its own banner,
+    so a log appended over multiple sessions still records which
+    config produced which rows. The config text is the raw bytes of
+    the .toml as-loaded plus a short SHA-256 hash, so even small
+    edits between runs (whitespace, comments) are detectable.
+    """
+    config_hash = hashlib.sha256(config_text.encode("utf-8")).hexdigest()[:12]
+    git_hash = _git_short_hash() or "(not a git checkout)"
+    sep = "# " + "-" * 70
+    log.write(sep + "\n")
+    log.write(
+        f"# Monitorio playback session #{n_sessions_so_far + 1} on this log file\n"
+    )
+    log.write(f"# session_started_utc: {started_iso}\n")
+    log.write(f"# config_path:         {config_path}\n")
+    log.write(f"# config_sha256_12:    {config_hash}\n")
+    log.write(f"# script_git_hash:     {git_hash}\n")
+    log.write(f"# python:              {sys.version.split()[0]} ({sys.platform})\n")
+    log.write("# --- begin config file snapshot ---\n")
+    for line in config_text.splitlines():
+        # Prefix every config line with "# " so it's a CSV comment.
+        log.write(f"#   {line}\n")
+    log.write("# --- end config file snapshot ---\n")
+    log.write(sep + "\n")
+    log.flush()
+
+
+def _count_existing_sessions(log_path: Path) -> int:
+    """Count how many '# Monitorio playback session #N' banners are already
+    in `log_path`, so the new session can number itself sequentially."""
+    if not log_path.exists():
+        return 0
+    n = 0
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("# Monitorio playback session #"):
+                    n += 1
+    except OSError:
+        pass
+    return n
+
+
 def run_session(config_path: Path) -> int:
     cfg = _load_config(config_path)
     videos, log_path = _resolve_paths(config_path, cfg)
@@ -483,7 +565,20 @@ def run_session(config_path: Path) -> int:
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     new_log = not log_path.exists() or log_path.stat().st_size == 0
+    config_text = config_path.read_text(encoding="utf-8")
+    n_existing_sessions = _count_existing_sessions(log_path)
+    session_started_iso = datetime.datetime.now(
+        datetime.timezone.utc,
+    ).isoformat(timespec="seconds")
     with log_path.open("a", encoding="utf-8") as log:
+        if not new_log:
+            # Visual gap between appended sessions in the same log.
+            log.write("\n")
+        _write_session_header(
+            log, config_path, config_text,
+            started_iso=session_started_iso,
+            n_sessions_so_far=n_existing_sessions,
+        )
         if new_log:
             log.write(
                 "play_index,start_time_iso,start_time_unix,"
