@@ -174,16 +174,35 @@ def _probe_video(path: Path) -> dict:
 
 def _play_one(
     video_path: Path, screen, screen_w: int, screen_h: int,
-) -> tuple[bool, float, int]:
+    *, info: dict | None = None,
+) -> dict:
     """Decode `video_path` and blit its frames into `screen`.
 
-    Returns (aborted_by_user, duration_seconds, frames_shown). Frames
-    are scheduled at their nominal interval (1 / fps) measured against
-    a single monotonic anchor at playback start, so any per-frame jitter
-    in the Python loop doesn't accumulate over a long video.
+    Returns a dict with playback diagnostics:
+      aborted: True iff user pressed ESC / closed the window.
+      duration: actual wall-clock duration of playback (seconds).
+      frames_shown: how many frames were blitted.
+      expected_frames: ffprobed frame count (None if ffprobe couldn't
+                       determine).
+      expected_duration: expected_frames / fps when known, else None.
+      max_late_ms: worst slip past a frame's nominal display time.
+      n_late_frames: number of frames whose blit was >= 5 ms past
+                     their target time (a rough "the playback fell
+                     behind here" indicator).
+      ffmpeg_returncode: exit status of the decoding ffmpeg process.
+      ffmpeg_stderr: any stderr output from ffmpeg (truncated).
+
+    Frames are scheduled at their nominal interval (1 / fps) measured
+    against a single monotonic anchor at playback start, so any
+    per-frame jitter in the Python loop doesn't accumulate over a long
+    video. If a frame falls behind (rendering can't keep up), we don't
+    sleep negative -- we move on and account for it in max_late_ms /
+    n_late_frames.
     """
-    info = _probe_video(video_path)
+    if info is None:
+        info = _probe_video(video_path)
     vw, vh, fps = info["width"], info["height"], info["fps"]
+    expected_frames = info.get("n_frames")
 
     if vw > screen_w or vh > screen_h:
         raise ValueError(
@@ -205,6 +224,8 @@ def _play_one(
     surf = pygame.Surface((vw, vh))
     aborted = False
     frames_shown = 0
+    max_late = 0.0
+    n_late = 0
     t_start = time.perf_counter()
     try:
         while True:
@@ -217,11 +238,17 @@ def _play_one(
             screen.fill((0, 0, 0))
             screen.blit(surf, (px, py))
 
-            # Wait until this frame's nominal show time.
             target = t_start + frames_shown * frame_period
             now = time.perf_counter()
-            if target > now:
-                time.sleep(target - now)
+            slip = now - target
+            if slip > 0:
+                # Behind schedule. Track but don't sleep negative.
+                if slip > max_late:
+                    max_late = slip
+                if slip > 0.005:
+                    n_late += 1
+            else:
+                time.sleep(-slip)  # i.e. sleep(target - now)
             pygame.display.flip()
 
             # Drain events; ESC or window-close aborts.
@@ -239,8 +266,35 @@ def _play_one(
     finally:
         if proc.poll() is None:
             proc.terminate()
-            proc.wait(timeout=2)
-    return aborted, time.perf_counter() - t_start, frames_shown
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    duration = time.perf_counter() - t_start
+    rc = proc.returncode
+    stderr_bytes = b""
+    if proc.stderr is not None:
+        try:
+            stderr_bytes = proc.stderr.read() or b""
+        except (OSError, ValueError):
+            pass
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+    if len(stderr_text) > 500:
+        stderr_text = stderr_text[:500] + "...[truncated]"
+
+    return {
+        "aborted": aborted,
+        "duration": duration,
+        "frames_shown": frames_shown,
+        "expected_frames": expected_frames,
+        "expected_duration": (expected_frames / fps) if expected_frames else None,
+        "max_late_ms": max_late * 1000.0,
+        "n_late_frames": n_late,
+        "ffmpeg_returncode": rc,
+        "ffmpeg_stderr": stderr_text,
+    }
 
 
 # ----- session driver -------------------------------------------------
@@ -260,6 +314,11 @@ def _wait_with_events(seconds: float, *, screen) -> bool:
                 return True
         # Sleep in small chunks so events stay responsive.
         time.sleep(min(0.05, remaining))
+
+
+def _say(msg: str) -> None:
+    """Status line to the operator's console. flush so it appears immediately."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 def run_session(config_path: Path) -> int:
@@ -287,6 +346,15 @@ def run_session(config_path: Path) -> int:
     seed = cfg.get("random", {}).get("seed")
     rng = random.Random(seed) if seed is not None else random.Random()
 
+    # Probe each video once up front so we (a) fail fast on corrupt
+    # files and (b) have the metadata cached for status messages.
+    video_info: dict[Path, dict] = {}
+    for v in videos:
+        try:
+            video_info[v] = _probe_video(v)
+        except RuntimeError as e:
+            raise RuntimeError(f"failed to probe video {v}: {e}") from e
+
     # Open the persistent fullscreen window. Stays open for the whole
     # session; we just blit into it as needed.
     pygame.display.init()
@@ -310,6 +378,34 @@ def run_session(config_path: Path) -> int:
 
     black()
 
+    # --- session-start banner ----------------------------------------
+    _say("=" * 64)
+    _say(f"Monitorio random playback session")
+    _say(f"  config:      {config_path}")
+    _say(f"  videos:      {len(videos)}")
+    for v in videos:
+        info = video_info[v]
+        nf = info["n_frames"]
+        dur = nf / info["fps"] if nf else float("nan")
+        _say(
+            f"    {v.name}  ({info['width']}x{info['height']}, "
+            f"{info['fps']:.2f} fps, {nf or '?'} frames, "
+            f"{dur:.2f} s)"
+        )
+    _say(f"  monitor:     #{monitor_idx} ({sw}x{sh})")
+    _say(
+        f"  IVI:         Exp(mean={mean_ivi:.1f} s) truncated to "
+        f"[{min_ivi:.1f}, {max_ivi:.1f}] s"
+    )
+    if n_plays is not None:
+        _say(f"  termination: n_plays = {n_plays}")
+    else:
+        _say(f"  termination: total_session_seconds = {total_seconds:.0f}")
+    _say(f"  log:         {log_path}")
+    _say(f"  seed:        {seed if seed is not None else '(random)'}")
+    _say(f"  press ESC during playback or IVI to abort cleanly.")
+    _say("=" * 64)
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
     new_log = not log_path.exists() or log_path.stat().st_size == 0
     with log_path.open("a", encoding="utf-8") as log:
@@ -317,62 +413,147 @@ def run_session(config_path: Path) -> int:
             log.write(
                 "play_index,start_time_iso,start_time_unix,"
                 "video_path,duration_seconds,frames_shown,"
-                "ivi_seconds,aborted\n"
+                "expected_frames,ivi_seconds,aborted,n_late_frames,"
+                "max_late_ms,ffmpeg_returncode\n"
             )
             log.flush()
 
         session_start = time.perf_counter()
         plays_done = 0
         aborted = False
+        n_failures = 0
         try:
             while not aborted:
+                # Termination conditions checked at top of loop.
                 if n_plays is not None and plays_done >= n_plays:
                     break
-                if total_seconds is not None and (
-                    time.perf_counter() - session_start
-                ) >= total_seconds:
+                elapsed = time.perf_counter() - session_start
+                if total_seconds is not None and elapsed >= total_seconds:
                     break
 
+                # Pick the next video and IVI now so we can announce
+                # both during the gap (operator can see what's coming).
+                video = rng.choice(videos)
+                info = video_info[video]
                 ivi = _sample_ivi(rng, mean_ivi, min_ivi, max_ivi)
-                print(
-                    f"  IVI #{plays_done + 1}: sleeping {ivi:.2f} s",
-                    file=sys.stderr,
+
+                if n_plays is not None:
+                    progress = f"{plays_done + 1}/{n_plays}"
+                else:
+                    pct = 100.0 * elapsed / total_seconds
+                    progress = f"#{plays_done + 1}, {pct:.1f}% elapsed"
+                _say(
+                    f"[{progress}] next: {video.name} "
+                    f"({info['n_frames'] or '?'} frames, "
+                    f"{(info['n_frames'] or 0) / info['fps']:.2f} s) "
+                    f"in {ivi:.1f} s"
                 )
+
                 aborted = _wait_with_events(ivi, screen=screen)
                 if aborted:
+                    _say("[abort] user pressed ESC during IVI")
                     break
 
-                video = rng.choice(videos)
                 t0_unix = time.time()
                 t0_iso = datetime.datetime.fromtimestamp(
                     t0_unix, tz=datetime.timezone.utc,
                 ).isoformat(timespec="microseconds")
-                print(
-                    f"  play #{plays_done + 1}: {video.name} at {t0_iso}",
-                    file=sys.stderr,
-                )
-                user_aborted, dur, frames = _play_one(
-                    video, screen, sw, sh,
-                )
+                _say(f"[{progress}] starting playback at {t0_iso}")
+
+                play_failed = False
+                play_failure_msg = ""
+                try:
+                    res = _play_one(
+                        video, screen, sw, sh, info=info,
+                    )
+                except Exception as e:
+                    play_failed = True
+                    play_failure_msg = repr(e)
+                    res = {
+                        "aborted": False, "duration": 0.0, "frames_shown": 0,
+                        "expected_frames": info.get("n_frames"),
+                        "expected_duration": None,
+                        "max_late_ms": 0.0, "n_late_frames": 0,
+                        "ffmpeg_returncode": -1,
+                        "ffmpeg_stderr": "",
+                    }
                 black()
 
+                # Failure detection + status. Things we flag:
+                # - Python-level exception during playback
+                # - ffmpeg exited with a non-zero code
+                # - Frame count differs significantly from probed count
+                # - Significant slip (lots of late frames)
+                problems = []
+                if play_failed:
+                    problems.append(f"exception: {play_failure_msg}")
+                rc = res["ffmpeg_returncode"]
+                if rc not in (0, None):
+                    problems.append(
+                        f"ffmpeg exit {rc}: {res['ffmpeg_stderr'][:200]}"
+                    )
+                exp_frames = res["expected_frames"]
+                if exp_frames is not None and not res["aborted"]:
+                    delta = res["frames_shown"] - exp_frames
+                    if abs(delta) > max(2, int(0.01 * exp_frames)):
+                        problems.append(
+                            f"frame count {res['frames_shown']} vs probed "
+                            f"{exp_frames} (off by {delta:+d})"
+                        )
+                if res["n_late_frames"] > max(5, 0.05 * res["frames_shown"]):
+                    problems.append(
+                        f"{res['n_late_frames']} of {res['frames_shown']} "
+                        f"frames slipped past their target time "
+                        f"(max {res['max_late_ms']:.1f} ms late)"
+                    )
+
+                # Per-play summary line.
+                tag = "ABORTED" if res["aborted"] else (
+                    "FAILED" if problems else "ok"
+                )
+                _say(
+                    f"[{progress}] {tag}: {res['frames_shown']} frames "
+                    f"in {res['duration']:.3f} s "
+                    f"(target {(res['expected_duration'] or 0):.3f} s, "
+                    f"max slip {res['max_late_ms']:.1f} ms)"
+                )
+                for p in problems:
+                    _say(f"  ! {p}")
+                if problems:
+                    n_failures += 1
+
+                # Log row -- always written, even on failure, so the
+                # CSV is a faithful record of what happened.
                 log.write(
                     f"{plays_done + 1},{t0_iso},{t0_unix:.6f},"
-                    f"{video},{dur:.6f},{frames},{ivi:.4f},"
-                    f"{str(user_aborted).lower()}\n"
+                    f"{video},{res['duration']:.6f},{res['frames_shown']},"
+                    f"{exp_frames if exp_frames is not None else ''},"
+                    f"{ivi:.4f},{str(res['aborted']).lower()},"
+                    f"{res['n_late_frames']},{res['max_late_ms']:.3f},"
+                    f"{rc if rc is not None else ''}\n"
                 )
                 log.flush()
                 plays_done += 1
-                if user_aborted:
+
+                if res["aborted"]:
                     aborted = True
+                    _say("[abort] user pressed ESC during playback")
         finally:
             pygame.mouse.set_visible(True)
             pygame.display.quit()
-    print(
-        f"Session ended: {plays_done} play(s){'  (aborted)' if aborted else ''}",
-        file=sys.stderr,
+
+    # --- session-end summary -----------------------------------------
+    elapsed = time.perf_counter() - session_start
+    _say("=" * 64)
+    _say(
+        f"Session ended: {plays_done} play(s) over {elapsed:.1f} s"
+        f"{'  (aborted)' if aborted else ''}"
+        f"{f'  ({n_failures} flagged)' if n_failures else ''}"
     )
-    return 0
+    if plays_done:
+        _say(f"  log: {log_path}")
+    _say("=" * 64)
+    return 1 if n_failures else 0
 
 
 def main(argv: list[str] | None = None) -> int:
