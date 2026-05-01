@@ -35,6 +35,8 @@ Source/
   decodeSyncTags.m         MATLAB wrapper around decode_sync_tags.py
   setupMonitorioPython.m   MATLAB helper: pyenv setup against the repo venv
   calibration/             Python package for the calibration pipeline
+  loaders/                 File-format loaders (RHD, ...) for decoder input
+  playback/                Random-playback session driver (play_random.py)
     daq.py                 NI-DAQmx wrapper
     display.py             pygame-ce fullscreen drawing primitives
     procedure.py           baseline / localize / refine / rise-time / crosstalk
@@ -441,6 +443,32 @@ setupMonitorioPython('VenvPath', 'C:\path\to\some\other\venv');
 `pyenv` cannot be reconfigured after Python has been loaded in a
 session, so if you previously imported a different Python from MATLAB,
 restart MATLAB before re-running setup.
+
+
+## Random-playback session driver
+
+`Source/playback/play_random.py` runs a session of randomly-chosen
+tagged videos with exponentially-distributed inter-video intervals,
+intended to drive the experimental rig while the DAQ records
+continuously. A single fullscreen pygame window opens on the chosen
+monitor and stays black for the entire session, with video frames
+blitted into it during plays -- so there's no per-play window
+open/close animation, no title bar, no chrome. Each play is logged to
+a CSV with wall-clock timestamps so the analyst can chunk the
+recording into per-play windows for the decoder.
+
+```bash
+venv/Scripts/python Source/playback/play_random.py CONFIG.toml
+```
+
+The config (TOML) names the videos, sets the IVI distribution
+(exponential with mean / truncated to a [min, max] range via rejection
+sampling), picks the target monitor, and points at the output log.
+See `Source/playback/example_config.toml` for a fully-commented example.
+
+Press ESC or close the window to abort mid-session. The log is
+flushed after every play, so an aborted session loses at most the
+in-progress play.
 
 
 ## Smoke tests

@@ -1,0 +1,41 @@
+# Example config for Source/playback/play_random.py.
+#
+# Relative paths are resolved relative to this config file's directory,
+# so you can keep the config + videos + log together and move the
+# folder around without breaking links.
+
+# Required: at least one tagged video. Pick from this list at random.
+videos = [
+    "tagged_videos/clip01.mp4",
+    "tagged_videos/clip02.mp4",
+    "tagged_videos/clip03.mp4",
+]
+
+[timing]
+# Inter-video interval is drawn from Exp(1/mean_ivi_seconds) and
+# accepted only if it falls within [min_ivi_seconds, max_ivi_seconds].
+# Drafts that fall outside the range are rejected and re-sampled.
+mean_ivi_seconds = 30.0
+min_ivi_seconds = 5.0
+max_ivi_seconds = 120.0
+
+# Pick exactly ONE termination condition: a fixed number of plays...
+n_plays = 50
+# ...or a time-based cap (uncomment one):
+# total_session_seconds = 1800
+
+[display]
+# Which monitor to play on. 0 = primary; pygame's display index list
+# matches the OS's native ordering.
+monitor_index = 1
+
+[output]
+# Where to write the playback log. Created on first run, appended
+# thereafter (so resuming a session keeps history). Relative to the
+# config file's directory.
+log_path = "playback_log.csv"
+
+[random]
+# Optional: fix the seed for deterministic IVI / video selection. Omit
+# (or set to anything non-integer) to use system entropy.
+seed = 42
