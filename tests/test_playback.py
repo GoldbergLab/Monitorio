@@ -15,7 +15,9 @@ from pathlib import Path
 
 import pytest
 
-from playback.play_random import _load_config, _resolve_paths, _sample_ivi
+from playback.play_random import (
+    _check_ivi_params, _load_config, _resolve_paths, _sample_ivi,
+)
 
 
 def test_sample_ivi_respects_truncation():
@@ -44,6 +46,78 @@ def test_sample_ivi_clips_when_truncation_unreachable():
     rng = random.Random(0)
     val = _sample_ivi(rng, mean_s=1.0, lo_s=100.0, hi_s=200.0, max_attempts=10)
     assert 100.0 <= val <= 200.0
+
+
+def test_check_ivi_params_sane_combo_is_silent():
+    assert _check_ivi_params(mean_s=30.0, lo_s=5.0, hi_s=120.0) == []
+    # Boundary cases (mean equal to lo or hi) are a degenerate but
+    # technically valid choice; no warning.
+    assert _check_ivi_params(mean_s=5.0, lo_s=5.0, hi_s=120.0) == []
+    assert _check_ivi_params(mean_s=120.0, lo_s=5.0, hi_s=120.0) == []
+
+
+def test_check_ivi_params_warns_when_mean_below_min():
+    warns = _check_ivi_params(mean_s=3.0, lo_s=5.0, hi_s=120.0)
+    assert len(warns) == 1
+    assert "below" in warns[0]
+    assert "swap min and mean" in warns[0]
+
+
+def test_check_ivi_params_warns_when_mean_above_max():
+    warns = _check_ivi_params(mean_s=200.0, lo_s=5.0, hi_s=120.0)
+    assert len(warns) == 1
+    assert "above" in warns[0]
+    assert "swap mean and max" in warns[0]
+
+
+def test_run_session_rejects_min_geq_max(tmp_path):
+    """min >= max would make rejection sampling impossible -- treat as
+    a hard error at config-load time so we don't even open the window."""
+    from playback.play_random import run_session
+    (tmp_path / "v.mp4").touch()
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(
+        'videos = ["v.mp4"]\n'
+        '[timing]\n'
+        'min_ivi_seconds = 10.0\n'
+        'mean_ivi_seconds = 20.0\n'
+        'max_ivi_seconds = 5.0\n'   # < min, the failure case
+        'n_plays = 3\n'
+    )
+    with pytest.raises(ValueError, match="strictly less"):
+        run_session(cfg)
+
+
+def test_run_session_rejects_negative_min(tmp_path):
+    from playback.play_random import run_session
+    (tmp_path / "v.mp4").touch()
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(
+        'videos = ["v.mp4"]\n'
+        '[timing]\n'
+        'min_ivi_seconds = -1.0\n'
+        'mean_ivi_seconds = 5.0\n'
+        'max_ivi_seconds = 30.0\n'
+        'n_plays = 3\n'
+    )
+    with pytest.raises(ValueError, match=r"min_ivi_seconds must be >= 0"):
+        run_session(cfg)
+
+
+def test_run_session_rejects_nonpositive_mean(tmp_path):
+    from playback.play_random import run_session
+    (tmp_path / "v.mp4").touch()
+    cfg = tmp_path / "cfg.toml"
+    cfg.write_text(
+        'videos = ["v.mp4"]\n'
+        '[timing]\n'
+        'min_ivi_seconds = 5.0\n'
+        'mean_ivi_seconds = 0.0\n'
+        'max_ivi_seconds = 30.0\n'
+        'n_plays = 3\n'
+    )
+    with pytest.raises(ValueError, match="mean_ivi_seconds must be positive"):
+        run_session(cfg)
 
 
 def test_resolve_paths_relative_to_config_dir(tmp_path):

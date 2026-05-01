@@ -141,6 +141,36 @@ def _resolve_paths(config_path: Path, cfg: dict) -> tuple[list[Path], Path]:
 
 # ----- IVI sampling ---------------------------------------------------
 
+def _check_ivi_params(mean_s: float, lo_s: float, hi_s: float) -> list[str]:
+    """Return a list of warning strings about suspicious IVI parameters.
+
+    Hard errors (e.g. lo >= hi, negative mean) are caught later in
+    _sample_ivi by raising; this is just for soft "did you really mean
+    that?" sanity checks. Today: mean outside the [lo, hi] truncation
+    window. Rejection sampling still produces valid draws in that
+    case, but the resulting distribution is heavily clipped against
+    the bound nearest the mean -- almost certainly an oversight (e.g.
+    mistakenly entering parameters as min, mean, max in the wrong
+    order).
+    """
+    warns = []
+    if mean_s < lo_s:
+        warns.append(
+            f"timing.mean_ivi_seconds ({mean_s}) is below "
+            f"timing.min_ivi_seconds ({lo_s}); rejection sampling will "
+            f"clip aggressively against the lower bound, so most draws "
+            f"will be near {lo_s}. Did you swap min and mean by accident?"
+        )
+    elif mean_s > hi_s:
+        warns.append(
+            f"timing.mean_ivi_seconds ({mean_s}) is above "
+            f"timing.max_ivi_seconds ({hi_s}); rejection sampling will "
+            f"clip aggressively against the upper bound, so most draws "
+            f"will be near {hi_s}. Did you swap mean and max by accident?"
+        )
+    return warns
+
+
 def _sample_ivi(
     rng: random.Random, mean_s: float, lo_s: float, hi_s: float,
     max_attempts: int = 1000,
@@ -457,6 +487,24 @@ def run_session(config_path: Path) -> int:
     mean_ivi = float(timing.get("mean_ivi_seconds", 30.0))
     min_ivi = float(timing.get("min_ivi_seconds", 5.0))
     max_ivi = float(timing.get("max_ivi_seconds", 120.0))
+    # Hard errors that would make the session impossible. Catch these
+    # at config-load time before opening the fullscreen window so the
+    # operator gets the error message in the terminal.
+    if min_ivi < 0:
+        raise ValueError(
+            f"timing.min_ivi_seconds must be >= 0; got {min_ivi}."
+        )
+    if min_ivi >= max_ivi:
+        raise ValueError(
+            f"timing.min_ivi_seconds ({min_ivi}) must be strictly less "
+            f"than timing.max_ivi_seconds ({max_ivi}). With min >= max "
+            f"no IVI can be sampled in [min, max] and no videos would "
+            f"ever play."
+        )
+    if mean_ivi <= 0:
+        raise ValueError(
+            f"timing.mean_ivi_seconds must be positive; got {mean_ivi}."
+        )
     n_plays = timing.get("n_plays")
     total_seconds = timing.get("total_session_seconds")
     if n_plays is None and total_seconds is None:
@@ -573,6 +621,8 @@ def run_session(config_path: Path) -> int:
         f"  IVI:         Exp(mean={mean_ivi:.1f} s) truncated to "
         f"[{min_ivi:.1f}, {max_ivi:.1f}] s"
     )
+    for w in _check_ivi_params(mean_ivi, min_ivi, max_ivi):
+        _say(f"  warning:     {w}")
     if n_plays is not None:
         _say(f"  termination: n_plays = {n_plays}")
     else:

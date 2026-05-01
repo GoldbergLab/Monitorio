@@ -14,9 +14,10 @@ videos = [
 [timing]
 # Inter-video interval is drawn from Exp(1/mean_ivi_seconds) and
 # accepted only if it falls within [min_ivi_seconds, max_ivi_seconds].
-# Drafts that fall outside the range are rejected and re-sampled.
-mean_ivi_seconds = 30.0
+# Drafts that fall outside the range are rejected and re-sampled. The
+# script warns at startup if mean isn't in the (min, max) window.
 min_ivi_seconds = 5.0
+mean_ivi_seconds = 30.0
 max_ivi_seconds = 120.0
 
 # Pick exactly ONE termination condition: a fixed number of plays...
