@@ -124,9 +124,12 @@ def test_session_header_includes_config_snapshot_and_metadata(tmp_path):
 
     cfg_path = tmp_path / "cfg.toml"
     cfg_text = (
-        '# A friendly comment\n'
+        '# A friendly comment that should be stripped from the snapshot\n'
+        '\n'
+        '   # An indented comment also stripped\n'
         'videos = ["v1.mp4"]\n'
-        '[timing]\n'
+        '\n'
+        '[timing]   # trailing comments are kept (they are part of the line)\n'
         'mean_ivi_seconds = 30.0\n'
         'n_plays = 5\n'
     )
@@ -139,11 +142,18 @@ def test_session_header_includes_config_snapshot_and_metadata(tmp_path):
             started_iso="2026-05-01T12:00:00+00:00",
         )
     body = log.read_text()
+    # Banner + metadata.
     assert "Monitorio playback session" in body
     assert "config_sha256_12:" in body
     assert "session_started_utc: 2026-05-01T12:00:00+00:00" in body
-    for line in cfg_text.splitlines():
-        assert f"#   {line}" in body, f"missing config line: {line!r}"
+    # Real data lines made it through, with the CSV-comment "# " prefix.
+    assert '# videos = ["v1.mp4"]' in body
+    assert "# [timing]   # trailing comments are kept (they are part of the line)" in body
+    assert "# mean_ivi_seconds = 30.0" in body
+    assert "# n_plays = 5" in body
+    # Pure-comment lines and blank lines were stripped.
+    assert "A friendly comment" not in body
+    assert "An indented comment" not in body
 
 
 def test_config_snapshot_detects_drift_via_hash(tmp_path):

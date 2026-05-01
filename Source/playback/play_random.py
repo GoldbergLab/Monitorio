@@ -432,9 +432,18 @@ def _write_session_header(
     log.write(f"# config_sha256_12:    {config_hash}\n")
     log.write(f"# script_git_hash:     {git_hash}\n")
     log.write(f"# python:              {sys.version.split()[0]} ({sys.platform})\n")
+    # Snapshot the config: just the actual data lines, with TOML
+    # comments and blank lines stripped for compactness. The leading
+    # "# " on each line is the CSV comment marker (so pandas /
+    # csv.reader / etc. skip these lines as comments rather than
+    # parsing them as data rows); the TOML data itself isn't doubly-
+    # commented.
     log.write("# --- begin config file snapshot ---\n")
-    for line in config_text.splitlines():
-        log.write(f"#   {line}\n")
+    for raw in config_text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        log.write(f"# {raw.rstrip()}\n")
     log.write("# --- end config file snapshot ---\n")
     log.write(sep + "\n")
     log.flush()
