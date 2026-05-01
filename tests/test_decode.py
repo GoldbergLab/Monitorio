@@ -70,7 +70,12 @@ def _tag_video(
     tmp_path: Path, cal: Path, *,
     sync_bit: bool = True, n_frames: int = N_FRAMES,
     pad_for_unambiguous_end: bool = True,
+    leading_guard_frames: int = 0,
 ) -> Path:
+    """Tag a synthetic test video. Defaults differ from the script's
+    defaults: guard frames are disabled here so per-frame bit-pattern
+    assertions reference frame 1 as the first tagged frame, not the
+    first guard. The dedicated guard-frames test re-enables them."""
     duration = n_frames / FPS
     vin = make_video(
         tmp_path / "in.mp4", SCREEN_W, SCREEN_H, duration=duration, fps=int(FPS),
@@ -78,7 +83,8 @@ def _tag_video(
     vout = tmp_path / ("out_sync.mp4" if sync_bit else "out_no_sync.mp4")
     cmd = [sys.executable, str(SCRIPT), str(vin), str(vout),
            "--calibration-file", str(cal),
-           "--sync-bit" if sync_bit else "--no-sync-bit"]
+           "--sync-bit" if sync_bit else "--no-sync-bit",
+           "--leading-guard-frames", str(int(leading_guard_frames))]
     if not pad_for_unambiguous_end:
         cmd.append("--no-pad-for-unambiguous-end")
     subprocess.run(cmd, capture_output=True, check=True)
@@ -422,6 +428,36 @@ def test_sync_bit_last_frame_all_zeros_no_ambiguity(tmp_path):
     assert result.frame_table.shape == (n_frames, 2)
     # No "Gray-encodes to all zeros" warning -- sync bit kept it visible.
     assert not any("all zeros" in w for w in result.warnings_)
+
+
+@requires_ffmpeg
+def test_leading_guard_frames_prepended(tmp_path):
+    # With leading_guard_frames=5, the tagger prepends 5 black-content
+    # untagged frames to the output. Those frames have sync OFF, so the
+    # decoder doesn't include them in the segment -- decoded frame N
+    # still maps directly to source video frame N.
+    cal = _make_cal(tmp_path)
+    n_source = 30
+    n_guards = 5
+    vout = _tag_video(
+        tmp_path, cal, sync_bit=True, n_frames=n_source,
+        leading_guard_frames=n_guards,
+    )
+    sidecar = json.loads(vout.with_suffix(vout.suffix + ".tags.json").read_text())
+    assert sidecar["leading_guard_frames"] == n_guards
+    assert sidecar["n_source_frames"] == n_source
+    assert sidecar["n_frames_written"] == n_source + n_guards
+
+    # Build a synthetic recording for the source frames only (mirrors
+    # the sync-on segment the decoder cares about). Decoder should map
+    # cleanly to source frames 1..n_source with no offset.
+    samples, expected_starts = _build_recording(sync_bit=True)
+    # _build_recording uses N_FRAMES = 30, which matches our n_source.
+    result = decode_sync_tags(samples, SAMPLE_RATE, vout, cal)
+    assert result.frame_table.shape == (n_source, 2)
+    for j, row in enumerate(result.frame_table):
+        assert int(row[0]) == j + 1
+        assert int(row[1]) == expected_starts[j]
 
 
 @requires_ffmpeg

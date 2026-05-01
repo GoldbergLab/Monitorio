@@ -39,10 +39,13 @@ BIT_R = 20
 def _tag(vin: Path, vout: Path, cal: Path) -> subprocess.CompletedProcess:
     # These tests verify geometric placement with all PDs treated as
     # frame bits, so explicitly disable sync-bit mode (which is the
-    # script's default).
+    # script's default). Also disable leading guard frames since the
+    # bit-pattern verification expects frame 1 of the output to carry
+    # gray(1)'s tags, not be a black guard.
     return subprocess.run(
         [sys.executable, str(SCRIPT), str(vin), str(vout),
-         "--calibration-file", str(cal), "--no-sync-bit"],
+         "--calibration-file", str(cal), "--no-sync-bit",
+         "--leading-guard-frames", "0"],
         capture_output=True, check=True,
     )
 

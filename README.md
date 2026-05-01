@@ -250,6 +250,13 @@ Selected flags:
   `--background-radius N` -- manual overrides for any of the calibrated
   values. All are in **screen pixel coords** (the same coord system the
   calibration JSON uses), not video-frame coords.
+- `--leading-guard-frames N` -- prepend N untagged black frames to the
+  output (default 5). Most video players silently skip 1–3 frames at
+  the start of playback; the guards absorb those skips so real source
+  frames still play cleanly. Guards have sync OFF, so the decoder's
+  segment detection ignores them entirely -- decoded frame N maps
+  directly to source video frame N regardless of how many guards the
+  player consumed (up to N). Set to 0 to disable.
 - `--sync-bit` / `--no-sync-bit` -- whether to reserve the first PD as
   an always-on "video active" indicator. **Enabled by default.** When
   on, PD index 0 in the calibration JSON (= the lowest-numbered live

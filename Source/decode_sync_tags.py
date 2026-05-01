@@ -203,6 +203,14 @@ def decode_sync_tags(
             file=sys.stderr,
         )
 
+    # If the sidecar tells us how many source frames to expect (i.e. the
+    # tagger wrote leading guards or trailing padding that don't carry
+    # video content), prefer that over ffprobe's total-frame count for
+    # the strict frame-count cross-check. Source frames are what the
+    # decoder actually sees in the sync-on segment.
+    if sidecar is not None and "n_source_frames" in sidecar:
+        expected_n_frames = int(sidecar["n_source_frames"])
+
     if verbose >= 1:
         print(
             f"[decode] video={video_path.name} fps={fps} "
@@ -396,18 +404,36 @@ def _decode_core(
                 if not video_on[s] and (e - s) < bridge_n:
                     video_on[s:e] = True
 
-    segments = _runs_of_true(video_on)
+    raw_segments = _runs_of_true(video_on)
+    # Drop sync-on runs that are too short to be a real video playback.
+    # Real video segments are seconds long; brief ON pulses (player
+    # startup flashes, cursor flickers, etc.) at much shorter durations
+    # are noise. Threshold of 0.25 s is generous -- well above any
+    # plausible glitch, well below any plausible video.
+    min_segment_samples = max(1, int(round(0.25 * sample_rate)))
+    segments = [
+        (s, e) for s, e in raw_segments if (e - s) >= min_segment_samples
+    ]
+    dropped = len(raw_segments) - len(segments)
     if verbose >= 2:
         print(
-            f"[decode] segments detected: {segments}",
+            f"[decode] raw segments: {raw_segments} "
+            f"({dropped} dropped as too short)",
             file=sys.stderr,
+        )
+    if dropped:
+        warnings_.append(
+            f"dropped {dropped} short sync-on run(s) (< 0.25 s) before "
+            f"the segment-count check; likely player startup flashes or "
+            f"glitches between videos."
         )
     if not segments:
         raise RuntimeError(
-            "No video segments detected (no sustained 'video on' state). "
-            "Check that the recording contains actual video playback, that "
-            "channel order matches the calibration JSON, and that the "
-            "scale factor produces voltages comparable to the calibration."
+            "No video segments detected (no sustained 'video on' state "
+            "lasting at least 0.25 s). Check that the recording contains "
+            "actual video playback, that channel order matches the "
+            "calibration JSON, and that the scale factor produces "
+            "voltages comparable to the calibration."
         )
     if len(segments) > 1:
         seg_lengths = [e - s for s, e in segments]
@@ -436,17 +462,68 @@ def _decode_core(
     frame_start_offsets = np.concatenate(([0], transition_offsets))
     cyclic_at_starts = decoded[frame_start_offsets]
 
-    # First frame must encode to gray(1 % cycle); anything else means the
-    # segment doesn't actually start at frame 1 (recording is partial,
-    # or thresholding/debouncing missed the real first transition).
+    # Drop "frames" whose duration is much shorter than the median frame
+    # duration. These are analog settling artifacts: at the segment's
+    # rising edge each PD crosses its threshold a few microseconds apart,
+    # producing a flurry of single-sample "frames" before the bit pattern
+    # settles. Same thing happens (less often) at the falling edge. A real
+    # frame is at minimum one monitor refresh long; a settling artifact is
+    # 1-3 samples. Median-vs-half-median is a comfortable separation that
+    # adapts automatically to whatever the effective frame rate of this
+    # recording happens to be (which differs from the declared fps when
+    # the monitor refresh rate doesn't match -- e.g. 60 Hz monitor on
+    # 45 fps video, where individual video frames span 1 or 2 refreshes
+    # and the median transition interval is the monitor refresh period,
+    # not the video frame period).
+    if len(frame_start_offsets) >= 3:
+        # Include "trailing duration" so the last detected "frame" gets
+        # the same outlier check as everything else.
+        durations = np.diff(
+            np.concatenate([frame_start_offsets, [seg_len]])
+        )
+        median_dur = float(np.median(durations))
+        keep = durations >= 0.5 * median_dur
+        n_dropped = int((~keep).sum())
+        if n_dropped:
+            kept_first_or_last = (not keep[0]) or (not keep[-1])
+            frame_start_offsets = frame_start_offsets[keep]
+            cyclic_at_starts = cyclic_at_starts[keep]
+            edge_note = (
+                " (mostly at segment edges, where rise/fall settling "
+                "artifacts cluster)"
+                if kept_first_or_last else ""
+            )
+            warnings_.append(
+                f"dropped {n_dropped} sub-frame-duration 'frames' as "
+                f"analog settling artifacts (< 0.5x median frame "
+                f"duration of {median_dur:.0f} samples){edge_note}. "
+                f"These are physically impossible video frames -- "
+                f"likely PD threshold crossings during a rising or "
+                f"falling brightness ramp."
+            )
+
+    # First frame ideally encodes to gray(1 % cycle). In real recordings
+    # the first transition often lands on a different value because the
+    # video player skipped or rushed past the very first frame(s), or the
+    # PD signals were still rising during frame 1. Don't error on this;
+    # warn and trust the unwrap. Frame numbering in the output table is
+    # then "1, 2, 3, ... relative to the first detected frame," which the
+    # caller can offset to absolute video frame numbers using the cyclic
+    # value of the first frame and the frame-count cross-check.
     expected_first = 1 % cycle
     if cyclic_at_starts[0] != expected_first:
-        raise RuntimeError(
-            f"first decoded cyclic frame is {int(cyclic_at_starts[0])}, "
-            f"expected {expected_first}. The segment doesn't start at "
-            f"frame 1 -- either the recording is missing the start of "
-            f"the video, or the threshold / debounce is misidentifying "
-            f"the first transition."
+        first_cyc = int(cyclic_at_starts[0])
+        warnings_.append(
+            f"first decoded cyclic frame is {first_cyc}, expected "
+            f"{expected_first} (gray-decoded value); the segment doesn't "
+            f"start cleanly at frame 1. Likely the player skipped one or "
+            f"more frames at startup, or the first frame's PD response "
+            f"hadn't settled by the time sync crossed threshold. The "
+            f"output table numbers frames 1..N from the first detected "
+            f"frame -- if you need absolute video frame numbers, add an "
+            f"offset of (expected_n_frames - decoded_count) to all "
+            f"frame_number entries (assumes any skipped frames were at "
+            f"the start)."
         )
 
     # Unwrap to absolute frame numbers, using sample timing to resolve
@@ -518,20 +595,24 @@ def _decode_core(
                 f"sample_rate/fps. Re-tag with --sync-bit to remove the "
                 f"ambiguity."
             )
-        elif abs(diff) > 1:
-            raise RuntimeError(
-                f"decoded {decoded_total} frames but the source video has "
-                f"{expected_n_frames}. The recording is either truncated, "
-                f"missing the trailing video-off pad, or the unwrap is "
-                f"miscounting (dropped frames near the end can be "
-                f"unrecoverable when there's no timing slack)."
-            )
         elif diff != 0:
+            # Soft warning. With real recordings the count is rarely
+            # exact: the player may skip 1-3 frames at startup, the PD
+            # signals may not have settled by sync onset, the trailing
+            # falling edge may be detected as a fractional frame. None
+            # of these are decoding *errors*; they're boundary effects
+            # the caller can compensate for. Severity scales with the
+            # magnitude of the mismatch.
+            severity = "minor" if abs(diff) <= 5 else "noteworthy"
             warnings_.append(
                 f"decoded {decoded_total} frames but the source video has "
-                f"{expected_n_frames} (off by {diff:+d}). Likely a single "
-                f"dropped frame near the end of the recording, or a "
-                f"boundary-rounding artifact in the segment detection."
+                f"{expected_n_frames} (off by {diff:+d} -- {severity}). "
+                f"Likely the player skipped frames at startup, dropped "
+                f"frames mid-playback, or the segment boundary detection "
+                f"missed a frame at the very start/end. Output frames are "
+                f"still numbered 1..{decoded_total} relative to the first "
+                f"detected frame; if you need absolute video frame "
+                f"numbers, account for any startup skip when correlating."
             )
 
     # Measured frame rate cross-check: time per frame as observed in the

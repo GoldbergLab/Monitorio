@@ -118,6 +118,7 @@ def add_video_sync_tags(
     screen_size: tuple[int, int] | None = None,
     sync_bit: bool = True,
     pad_for_unambiguous_end: bool = True,
+    leading_guard_frames: int = 5,
     codec: str = "libx264",
     preset: str | None = None,
     quality: int = 18,
@@ -346,6 +347,22 @@ def add_video_sync_tags(
         else None
     )
 
+    # Write leading guard frames before tagging the actual input video.
+    # These are pure-black, untagged frames -- background disks not even
+    # drawn, so all PDs read 'video off' regardless of any sync setting.
+    # Their job is to absorb startup glitches in the player (most players
+    # silently skip the first 1-3 frames after a play() call), so any
+    # real source-video frames the user cares about start at frame
+    # leading_guard_frames + 1 in the output. Even if the player skips
+    # all of them, the recording's segment still begins exactly at
+    # source frame 1.
+    n_guards = max(0, int(leading_guard_frames))
+    if n_guards > 0:
+        guard_frame = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        guard_bytes = guard_frame.tobytes()
+        for _ in range(n_guards):
+            write_proc.stdin.write(guard_bytes)
+
     frames_written = 0
     try:
         while True:
@@ -458,7 +475,9 @@ def add_video_sync_tags(
         "output_video": str(video_out),
         "calibration_file": str(calibration_file) if calibration_file else None,
         "fps": float(fps),
-        "n_frames_written": int(frames_written),
+        "n_frames_written": int(frames_written + n_guards),
+        "n_source_frames": int(frames_written),
+        "leading_guard_frames": int(n_guards),
         "padded_frames": int(padded_frames),
         "screen_size": [int(screen_w), int(screen_h)],
         "output_size": [int(out_w), int(out_h)],
@@ -760,6 +779,15 @@ def _cli():
              "with 'video off' in the recording). Default: enabled.",
     )
     tag.add_argument(
+        "--leading-guard-frames", dest="leading_guard_frames",
+        type=int, default=5,
+        help="prepend N untagged black frames to the output, so most "
+             "video players' first-frame skips are absorbed into the "
+             "guard rather than into real source frames. Defaults to 5 "
+             "(comfortable margin -- few players skip more than 1-3 "
+             "frames at startup). Set to 0 to disable.",
+    )
+    tag.add_argument(
         "--codec", default="libx264",
         help="ffmpeg encoder name. Default 'libx264' (CPU, always works). "
              "Use 'h264_nvenc' or 'hevc_nvenc' for NVIDIA GPU acceleration "
@@ -799,6 +827,7 @@ def _cli():
             screen_size=tuple(args.screen_size) if args.screen_size else None,
             sync_bit=args.sync_bit,
             pad_for_unambiguous_end=args.pad_for_unambiguous_end,
+            leading_guard_frames=args.leading_guard_frames,
             codec=args.codec, preset=args.preset, quality=quality,
             show_progress=args.progress,
         )

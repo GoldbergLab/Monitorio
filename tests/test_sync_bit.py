@@ -58,7 +58,9 @@ def test_sync_bit_default_reserves_first_pd(tmp_path):
     vout = tmp_path / "out.mp4"
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), str(vin), str(vout),
-         "--calibration-file", str(cal)],  # default: --sync-bit on
+         "--calibration-file", str(cal),  # default: --sync-bit on
+         "--leading-guard-frames", "0"],  # disable guards: tests verify
+                                          # bit pattern starting at frame 1
         capture_output=True, check=True,
     )
     assert b"sync bit:" in proc.stderr
@@ -98,7 +100,8 @@ def test_sync_bit_frame_at_cycle_multiple_is_distinguishable_from_off(tmp_path):
     vout = tmp_path / "out.mp4"
     subprocess.run(
         [sys.executable, str(SCRIPT), str(vin), str(vout),
-         "--calibration-file", str(cal)],
+         "--calibration-file", str(cal),
+         "--leading-guard-frames", "0"],
         capture_output=True, check=True,
     )
     states = _decode_pd_states(vout)
@@ -121,7 +124,8 @@ def test_no_sync_bit_uses_all_pds_for_frame(tmp_path):
     vout = tmp_path / "out.mp4"
     subprocess.run(
         [sys.executable, str(SCRIPT), str(vin), str(vout),
-         "--calibration-file", str(cal), "--no-sync-bit"],
+         "--calibration-file", str(cal), "--no-sync-bit",
+         "--leading-guard-frames", "0"],
         capture_output=True, check=True,
     )
     states = _decode_pd_states(vout)

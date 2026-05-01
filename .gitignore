@@ -18,3 +18,6 @@ __pycache__/
 calibration_cache.npz
 calibration_*.json
 rise_time_traces_*.npz
+
+# Local debugging scripts (not part of the project).
+scratch_*.py
