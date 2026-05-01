@@ -583,9 +583,27 @@ def run_session(config_path: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("config", type=Path, help="path to TOML config file")
+    example_cfg = Path(__file__).resolve().parent / "example_config.toml"
+    p = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        epilog=(
+            "Example config: " + str(example_cfg) + "\n"
+            "  copy and edit it for your rig, then run:\n"
+            "    python Source/playback/play_random.py path/to/myconfig.toml\n"
+            "Press ESC during a play or an IVI to abort cleanly.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "config", type=Path, nargs="?",
+        help="path to TOML config file (see example linked below)",
+    )
     args = p.parse_args(argv)
+    if args.config is None:
+        # No-arg invocation: print help instead of argparse's terse
+        # "the following arguments are required" error.
+        p.print_help()
+        return 0
     if not args.config.exists():
         raise FileNotFoundError(args.config)
     return run_session(args.config.resolve())
