@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "timestamp": "2026-04-28T19:23:34.940226+00:00",
+  "monitor": {
+    "index": 1,
+    "width": 1600,
+    "height": 2560
+  },
+  "daq": {
+    "device": "Dev1",
+    "product_type": "USB-6210",
+    "terminal_config": "DIFF",
+    "dc_sample_rate_hz": 5000.0,
+    "rise_time_sample_rate_hz": 50000.0
+  },
+  "photodiodes": [
+    {
+      "channel": "Dev1/ai2",
+      "x_px": 1512.0408026561038,
+      "y_px": 2166.794805893302,
+      "fwhm_x_px": 34,
+      "fwhm_y_px": 33,
+      "bit_radius_px": 26,
+      "background_radius_px": 39,
+      "baseline_dark_v": 0.003296555532028182,
+      "baseline_bright_v": 0.3467415386359795,
+      "dynamic_range_v": 0.34344498310395133,
+      "rise_duration_s": 0.00032,
+      "fall_duration_s": 0.00026,
+      "rise_latency_s": 0.05372,
+      "fall_latency_s": 0.0553
+    },
+    {
+      "channel": "Dev1/ai6",
+      "x_px": 1510.750099888017,
+      "y_px": 2258.4145343761634,
+      "fwhm_x_px": 33,
+      "fwhm_y_px": 33,
+      "bit_radius_px": 25,
+      "background_radius_px": 36,
+      "baseline_dark_v": 0.0030949284779569954,
+      "baseline_bright_v": 0.34140055619149373,
+      "dynamic_range_v": 0.3383056277135367,
+      "rise_duration_s": 0.0003,
+      "fall_duration_s": 0.00024,
+      "rise_latency_s": 0.0558,
+      "fall_latency_s": 0.05696
+    },
+    {
+      "channel": "Dev1/ai7",
+      "x_px": 1508.3892204817932,
+      "y_px": 2437.6983081575945,
+      "fwhm_x_px": 33,
+      "fwhm_y_px": 34,
+      "bit_radius_px": 26,
+      "background_radius_px": 37,
+      "baseline_dark_v": 0.003182091886316873,
+      "baseline_bright_v": 0.3536804083777949,
+      "dynamic_range_v": 0.35049831649147806,
+      "rise_duration_s": 0.00032,
+      "fall_duration_s": 0.00026,
+      "rise_latency_s": 0.05662,
+      "fall_latency_s": 0.05826
+    }
+  ],
+  "crosstalk": {
+    "channels": [
+      "Dev1/ai2",
+      "Dev1/ai6",
+      "Dev1/ai7"
+    ],
+    "matrix": [
+      [
+        0.7757640922877221,
+        0.00019542277019812967,
+        0.00016141014991010529
+      ],
+      [
+        0.00019728695687545576,
+        0.7277866293474623,
+        0.00015108740776733308
+      ],
+      [
+        0.00020016006790577056,
+        0.0001545881615022228,
+        0.7502345421402183
+      ]
+    ],
+    "max_off_diagonal": [
+      0.00019542277019812967,
+      0.00019728695687545576,
+      0.00020016006790577056
+    ],
+    "threshold": 0.01,
+    "acceptable": true
+  }
+}

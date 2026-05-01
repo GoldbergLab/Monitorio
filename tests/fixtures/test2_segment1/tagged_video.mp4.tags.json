@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "tagged_at_utc": "2026-05-01T20:12:17+00:00",
+  "input_video": "Z:\\ap2527\\AP_good_files_combined\\03_01_CUNY08\\fixed\\0301_50415_w.mp4",
+  "output_video": "Z:\\ap2527\\AP_good_files_combined\\withTags\\03_01_CUNY08\\0301_50415_w.mp4",
+  "calibration_file": "Z:\\ap2527\\calibration_20260428-151918.json",
+  "fps": 45.0,
+  "n_frames_written": 456,
+  "n_source_frames": 451,
+  "leading_guard_frames": 5,
+  "padded_frames": 0,
+  "screen_size": [
+    1600,
+    2560
+  ],
+  "output_size": [
+    1200,
+    1920
+  ],
+  "sync_bit": true,
+  "n_pds": 3,
+  "n_frame_bits": 2,
+  "cycle": 4,
+  "channel_assignment": {
+    "sync": "Dev1/ai2",
+    "frame_bits": [
+      "Dev1/ai6",
+      "Dev1/ai7"
+    ]
+  }
+}
