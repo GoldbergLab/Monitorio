@@ -257,12 +257,13 @@ def _play_one(
             file=sys.stderr,
         )
 
+    # VLC parses media internally when play() is called and surfaces
+    # parse / decode failures via the Error state in the wait loop
+    # below, so we don't need an explicit pre-play parse step. (The
+    # python-vlc parse-status enum doesn't expose a stable name for
+    # the "in progress" value across versions, which makes any
+    # parse-and-poll dance brittle.)
     media = vlc_instance.media_new(str(video_path))
-    # Parsing the media synchronously gets us the duration before play()
-    # so we can detect early-exits.
-    media.parse_with_options(vlc.MediaParseFlag.local, timeout=2000)
-    while media.get_parsed_status() == vlc.MediaParsedStatus.pending:
-        time.sleep(0.01)
     vlc_player.set_media(media)
 
     aborted = False
