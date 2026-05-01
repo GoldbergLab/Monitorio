@@ -71,7 +71,37 @@ import tomllib
 from pathlib import Path
 
 import pygame
-import vlc
+try:
+    import vlc
+except OSError as _vlc_err:
+    # python-vlc loads libvlc.dll via ctypes at import time. Two common
+    # ways this fails on a fresh box:
+    #   - WinError 193 / "%1 is not a valid Win32 application": Python's
+    #     and VLC's bitness disagree (most often 64-bit Python paired
+    #     with a 32-bit VLC install, or vice versa). Install matching-
+    #     bitness VLC; check Python bitness via
+    #     python -c "import struct; print(struct.calcsize('P')*8)".
+    #   - "Could not find module 'libvlc.dll'": VLC isn't installed at
+    #     all, or its install dir isn't on PATH. Install from
+    #     https://www.videolan.org/ or set VLC_PLUGIN_PATH.
+    _winerr = getattr(_vlc_err, "winerror", None)
+    if _winerr == 193:
+        raise OSError(
+            "Failed to load libvlc.dll: bitness mismatch between Python "
+            "and the installed VLC. Run "
+            "  python -c \"import struct; print(struct.calcsize('P')*8)\"  "
+            "to see Python's bitness, then install matching-bitness VLC "
+            "from https://www.videolan.org/ (64-bit VLC for 64-bit "
+            "Python, etc.). If both bitnesses are installed, put the "
+            "matching VLC dir on PATH ahead of the other."
+        ) from _vlc_err
+    raise OSError(
+        "Failed to import the VLC bindings (python-vlc). Make sure VLC "
+        "media player itself is installed system-wide -- python-vlc is "
+        "just the bindings; it loads VLC's libvlc.dll at import. "
+        "Install VLC from https://www.videolan.org/ if you haven't "
+        f"already. Original error: {_vlc_err!r}"
+    ) from _vlc_err
 
 
 # ----- config loading -------------------------------------------------
