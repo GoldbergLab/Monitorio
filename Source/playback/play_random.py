@@ -393,6 +393,20 @@ def _wait_with_events(seconds: float, *, screen) -> bool:
         time.sleep(min(0.05, remaining))
 
 
+def _wait_for_escape(screen) -> None:
+    """Block indefinitely until the operator presses ESC or closes the
+    window. Pumps pygame events at a low duty cycle so the window stays
+    responsive without burning CPU.
+    """
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                return
+        time.sleep(0.05)
+
+
 def _say(msg: str) -> None:
     """Status line to the operator's console. flush so it appears immediately."""
     print(msg, file=sys.stderr, flush=True)
@@ -756,6 +770,22 @@ def run_session(config_path: Path) -> int:
                 if res["aborted"]:
                     aborted = True
                     _say("[abort] user pressed ESC during playback")
+
+            # Loop exited cleanly (limit reached, not user-aborted).
+            # Hold a black screen indefinitely until the operator
+            # presses ESC, so the screen the birds see during the
+            # post-session window stays dark instead of snapping back
+            # to whatever Windows was showing underneath. If the
+            # operator already aborted, skip the hold -- they pressed
+            # ESC to leave, no need to make them press it twice.
+            if not aborted:
+                _say(
+                    "Session limit reached. Holding black screen; "
+                    "press ESC to close the window."
+                )
+                screen.fill((0, 0, 0))
+                pygame.display.flip()
+                _wait_for_escape(screen)
         finally:
             pygame.mouse.set_visible(True)
             pygame.display.quit()
