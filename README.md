@@ -34,9 +34,7 @@ Source/
   decode_sync_tags.py      Python module: recover video frame # per DAQ sample
   decodeSyncTags.m         MATLAB wrapper around decode_sync_tags.py
   setupMonitorioPython.m   MATLAB helper: pyenv setup against the repo venv
-  calibration/             Python package for the calibration pipeline
-  loaders/                 File-format loaders (RHD, ...) for decoder input
-  playback/                Random-playback session driver (play_random.py)
+  calibration/             Calibration pipeline (NI-DAQmx + pygame)
     daq.py                 NI-DAQmx wrapper
     display.py             pygame-ce fullscreen drawing primitives
     procedure.py           baseline / localize / refine / rise-time / crosstalk
@@ -46,7 +44,15 @@ Source/
     scripts/
       calibrate.py         CLI: full calibration end-to-end -> JSON output
       smoke_test_*.py      individual stage tests for development
+  loaders/                 File-format loaders for decoder input
+    rhd.py                 Intan RHD2000 .rhd parser (board ADC + headstage aux)
+  playback/                Random-playback session driver
+    play_random.py         CLI: timed random video playback into VLC
+    example_config.toml    fully-commented config example
+tests/                     pytest regression suite
+  fixtures/                small real-world data fixtures (a few MB total)
 requirements.txt           Python dependencies (driver + ffmpeg are external)
+requirements-dev.txt       extra deps for running the test suite (pytest)
 ```
 
 
@@ -81,9 +87,15 @@ If you're not using the Monitorio PCB, your replacement must:
 2. Settle within one video frame interval (a TIA bandwidth of ~1 kHz is
    plenty for 60 Hz video; the calibration procedure measures actual
    rise time and reports it).
-3. Plug into an NI-DAQmx-compatible analog input device. Channels can be
+3. Plug into an NI-DAQmx-compatible analog input device for
+   calibration (the calibration script uses NI-DAQmx directly). The
+   actual experimental recording can use any DAQ/ephys hardware
+   that produces a numpy array; the decoder is unit-agnostic with
+   the right `scale` argument. Channels for calibration can be
    single-ended (RSE/NRSE) or differential (DIFF/PSEUDO_DIFF); the
-   calibration script accepts a `--terminal-config` flag.
+   calibration script accepts a `--terminal-config` flag. A loader
+   for Intan RHD recordings is included
+   (`Source/loaders/rhd.py`); other formats are bring-your-own.
 
 
 ## Software requirements
@@ -107,42 +119,61 @@ Driver and OS-level tools (install separately, **not** via pip):
 Python packages (install with `pip install -r requirements.txt` inside
 a virtualenv):
 
-- `pygame-ce>=2.5` -- fullscreen rendering for the calibration patterns.
+- `pygame-ce>=2.5` -- fullscreen rendering for calibration patterns
+  and the random-playback driver.
 - `numpy>=1.26`
-- `nidaqmx>=1.0` -- requires the NI driver above.
-- `matplotlib>=3.8` -- optional; used only for the inspection plots that
-  pop up at the end of calibration.
+- `nidaqmx>=1.0` -- requires the NI driver above; only used by
+  calibration.
+- `matplotlib>=3.8` -- inspection plots that pop up at the end of
+  calibration; harmless if unused elsewhere.
+- `python-vlc>=3.0` -- bindings for the random-playback driver.
+  Skip / uninstall if you don't run `play_random.py`.
+
+For running the test suite, also: `pip install -r requirements-dev.txt`
+(currently just `pytest`).
 
 
 ## Pipeline overview
 
 ```
-   +-----------+       +---------------+       +---------------+
-   | calibrate |  -->  | tag the video |  -->  | record video  |
-   |  (one-off)|       |   (per video) |       | + DAQ trace   |
-   +-----------+       +---------------+       +---------------+
-        |                      ^                       |
-        v                      |                       v
-   calibration JSON  ----------+              decode DAQ trace
-                                              into frame numbers
-                                              (downstream script)
+   +-----------+    +-------+    +--------+    +--------+    +--------+
+   | calibrate | -> |  tag  | -> | play / | -> | decode | -> |  use   |
+   | (one-off) |    | video |    | record |    |  per   |    | frame  |
+   |           |    |       |    |        |    | sample |    |  -> t  |
+   +-----------+    +-------+    +--------+    +--------+    +--------+
+        |               ^   ^             |        ^               |
+        v               |   |             v        |               v
+   calibration ---------+   +---- tagged video --->|       (your analysis)
+   JSON                                            |
+                                                   |
+   DAQ samples (numpy array, any source) ----------+
 ```
 
 1. **Calibrate** the rig once after physically mounting the PD board.
    This locates each photodiode on the screen, picks bit-circle and
-   background-circle radii, measures monitor rise/fall time and channel
-   crosstalk, and writes everything to a JSON file.
-2. **Tag** each video you'll display: this writes a new copy with
-   Gray-coded bit circles overlaid at the calibrated positions.
+   background-circle radii, measures monitor rise/fall time and
+   channel crosstalk, and writes everything to a JSON file.
+2. **Tag** each video you'll display: a new copy with Gray-coded bit
+   circles overlaid at the calibrated screen-pixel positions, plus
+   leading guard frames (default 5) that absorb the first-frame
+   skips most video players do at startup.
 3. **Display** the tagged video on the calibrated rig and **record**
    the photodiode channels on the DAQ alongside whatever else the
-   experiment is sampling.
-4. **Decode** the DAQ trace with `Source/decode_sync_tags.py` (see
-   "`decode_sync_tags.py` reference" below): pass in the recorded `(n_channels, n_samples)`
-   array, the tagged video path, and the calibration JSON; get back a
-   table of `(frame_number, sample_index)` rows. The decoder reads the
-   tagger's `<output_video>.tags.json` sidecar to get the sync-bit
-   setting and channel-to-bit assignment automatically.
+   experiment is sampling. `Source/playback/play_random.py` automates
+   the display side (random video selection + exponential inter-video
+   gaps) for animal-experiment workflows.
+4. **Decode** the DAQ trace with `Source/decode_sync_tags.py`: pass
+   in the recorded `(n_channels, n_samples)` numpy array, the tagged
+   video path, and the calibration JSON. Get back a table of
+   `(frame_number, sample_index)` rows. The decoder reads the
+   tagger's `<output_video>.tags.json` sidecar automatically for the
+   sync-bit setting and channel-to-bit assignment. A loader for
+   Intan RHD recordings is included in `Source/loaders/rhd.py`;
+   other formats: load samples however you like.
+5. **Use** the resulting frame-number-per-sample mapping for the
+   actual analysis -- correlate neural events with what was on
+   screen, look up frame content in the *original* (untagged) video,
+   etc.
 
 
 ## Quick start
@@ -168,6 +199,27 @@ venv/Scripts/python Source/add_video_sync_tags.py \
     in.mp4 out.mp4 \
     --bit-xs 75,140,205,270 --bit-ys 1850 \
     --bit-radius 15 --background-radius 25
+
+# Run a random-playback session (drives the rig during recording):
+venv/Scripts/python Source/playback/play_random.py CONFIG.toml
+# (See Source/playback/example_config.toml for the config format.)
+```
+
+After recording, decode in Python:
+
+```python
+from decode_sync_tags import decode_sync_tags
+from loaders.rhd import load_rhd_board_adc   # Intan; or roll your own loader
+
+samples, sample_rate, _ = load_rhd_board_adc(["recording.rhd", "recording_2.rhd"])
+result = decode_sync_tags(
+    samples[2:5],                # the 3 channels carrying the PD signals
+    sample_rate=sample_rate,
+    video_path="exp01_tagged.mp4",
+    calibration_path="cal.json",
+    output_path="frame_table.csv",
+)
+# result.frame_table[:, 0] = frame numbers; result.frame_table[:, 1] = sample indices
 ```
 
 
@@ -237,16 +289,18 @@ Parameter resolution order (per parameter, top wins):
 3. Error -- there is no "default" because sensible values depend on
    the specific rig.
 
-Frame numbers are 1-indexed. With *N* sync tags, the encoder cycles
-through `2**N` distinct codes. **Videos longer than `2**N` frames wrap**
-through repeated cycles -- e.g. with 4 photodiodes (N=4, cycle=16), a
-1000-frame video produces ~62 cycles. The reflected-binary Gray code
-preserves the single-bit-change-per-step property at the wrap edge, so
-mid-transition robustness still holds. The decoder is responsible for
-disambiguating which cycle each sample belongs to (typically using its
-own timestamp and the known frame rate). One quirk: frame `2**N`
-(`16, 32, 48, ...`) Gray-encodes to all bits off, which is visually
-indistinguishable from no tag -- the decoder must accept that case.
+Frame numbers are 1-indexed. With sync-bit mode (the default,
+`--sync-bit`), the first PD is reserved as an always-on indicator
+and the remaining N-1 PDs carry an N-1-bit Gray-coded frame counter
+that cycles every `2**(N-1)` frames. The Gray code preserves the
+single-bit-change-per-step property across the wrap edge; the
+decoder disambiguates which cycle each sample belongs to using sample
+timing and frame-rate info from the tagged video. With `--no-sync-bit`,
+all N PDs carry the counter (cycle `2**N`), but frames at every
+multiple of the cycle Gray-encode to all-bits-off, which is
+indistinguishable from "video off" in the recording -- so the
+default `--sync-bit` is recommended unless you really need the extra
+bit of cycle length.
 
 Selected flags:
 
@@ -277,6 +331,13 @@ Selected flags:
   disambiguate cycles from timing more often. The script prints the
   sync/frame-bit channel assignment at startup so a decoder author can
   confirm it.
+- `--pad-for-unambiguous-end` / `--no-pad-for-unambiguous-end` --
+  only relevant in `--no-sync-bit` mode. If the input video's frame
+  count is an exact multiple of the cycle length, the very last
+  frame Gray-encodes to all-zeros and would be indistinguishable from
+  "video off." With this flag (default on), the tagger appends a
+  single extra black-content frame so the final tag pattern is
+  unambiguous. No-op in sync-bit mode (the issue can't arise there).
 - `--screen-size WxH` -- screen pixel dimensions of the display the PD
   board is mounted on, e.g. `2400x1600`. Required unless
   `--calibration-file` is given (then read from the JSON's
@@ -340,27 +401,30 @@ output that records the sync-bit setting and channel-to-bit assignment;
 the decoder reads it automatically. Pass `sync_bit_override=True/False`
 to force a value (useful if the sidecar is missing or wrong).
 
-The decoder operates in **strict mode**: it assumes the recording
-contains exactly one complete video playback bracketed by "video off"
-padding on both sides, and raises `RuntimeError` otherwise. Specifically
-it errors out if:
+The decoder assumes the recording contains exactly one complete
+video playback bracketed by "video off" padding on both sides. It
+raises `RuntimeError` for fundamental problems:
 
-- No bimodal signal is detected on the sync-bit channel (or any channel
-  in `--no-sync-bit` mode) -- recording probably has no video, the
-  channel order doesn't match calibration, or the scale factor produced
-  near-constant voltages.
-- More than one video segment is detected (chunk the recording yourself
-  before passing it in).
-- The first decoded frame doesn't match Gray-code value 1 (segment
-  doesn't start at frame 1, recording is partial, or threshold/debounce
-  picked the wrong first transition).
-- The decoded total frame count doesn't match the source video's frame
-  count to within ±1 (recording truncated, or unwrap miscounted).
+- No bimodal signal on the sync-bit channel (or any channel in
+  `--no-sync-bit` mode). Recording probably has no video at all, the
+  channel order doesn't match calibration, or the scale factor
+  produced near-constant voltages.
+- More than one sync-on segment longer than 0.25 s detected (chunk
+  the recording yourself before passing it in).
 
 Softer issues land in `result.warnings_` (and the CSV's `# warning:`
-header lines): per-channel threshold drift vs. calibration, individual
-dropped frames recovered via timing, fps mismatch between the recording
-and the video file's metadata, etc.
+header lines):
+
+- The first decoded frame's cyclic value isn't gray(1) -- the player
+  may have skipped a frame at the start, or the leading guard frames
+  ate it.
+- Decoded frame count differs from the source video's count
+  (severity tiers `minor` ≤ 5, `noteworthy` > 5).
+- Per-channel threshold drift vs. calibration baselines.
+- Individual dropped frames recovered via timing.
+- Measured fps disagrees with the declared fps by more than 1%.
+- Sub-frame-duration "frames" detected at segment boundaries
+  (analog rise/fall settling artifacts) and dropped automatically.
 
 Specific case worth flagging in **--no-sync-bit mode**: if the video's
 total frame count is an exact multiple of `2**n_pds` (i.e. the cycle
@@ -462,9 +526,7 @@ render its video output into the pygame window's HWND, so the same
 window does double-duty as "black between plays" (pygame) and "video
 playback surface" (VLC). One persistent window for the whole
 session means no per-play window open/close animations, no title
-bar, no chrome -- and VLC handles audio + video sync natively. Each
-play is logged to a CSV with wall-clock timestamps so the analyst
-can chunk the recording into per-play windows for the decoder.
+bar, no chrome -- and VLC handles audio + video sync natively.
 
 Requires VLC installed system-wide; see "Software requirements".
 
@@ -472,14 +534,33 @@ Requires VLC installed system-wide; see "Software requirements".
 venv/Scripts/python Source/playback/play_random.py CONFIG.toml
 ```
 
-The config (TOML) names the videos, sets the IVI distribution
-(exponential with mean / truncated to a [min, max] range via rejection
-sampling), picks the target monitor, and points at the output log.
-See `Source/playback/example_config.toml` for a fully-commented example.
+Run with no arguments to print usage + a path to the example config.
 
-Press ESC or close the window to abort mid-session. The log is
-flushed after every play, so an aborted session loses at most the
-in-progress play.
+The config (TOML) names the videos, sets the IVI distribution
+(exponential mean truncated to `[min, max]` via rejection sampling,
+with a startup sanity-check that errors on `min >= max` and warns
+when `mean` falls outside `[min, max]`), picks the target monitor,
+and points at the output log. See `Source/playback/example_config.toml`
+for a fully-commented example.
+
+Each session writes to its own log file: the config's
+`output.log_path` is treated as a base, and the actual filename
+inserts a UTC timestamp (`playback_log_20260501T230000.csv`). At
+the top of every log is a `#`-prefixed banner with the
+session-start UTC timestamp, the config's path and short SHA-256
+hash, the script's git commit (with `-dirty` flag if uncommitted
+changes are present), and a snapshot of the actual config-file
+contents -- so it's always possible to reconstruct exactly what
+ran. CSV readers skip the banner via `pd.read_csv(comment='#')`
+or equivalent.
+
+Press ESC at any time during playback or an inter-video gap to
+abort cleanly. When the session reaches its `n_plays` or
+`total_session_seconds` limit naturally, the screen stays black
+indefinitely until the operator presses ESC -- so the post-session
+view doesn't snap back to whatever Windows was showing underneath
+mid-experiment. The log flushes after every play, so an aborted
+session loses at most the in-progress play.
 
 
 ## Smoke tests
@@ -514,18 +595,32 @@ filter tests skip if the `nidaqmx` package isn't importable.
 ## Caveats and limitations
 
 - LCDs have slow pixels and may show PWM in their backlight. The
-  `--rise-time` measurement reports actual transition times; if the
-  monitor's response is so slow that the per-frame transition isn't
-  complete before the next refresh, the bit pattern is unreliable.
-  OLED is recommended for timing-critical work.
+  rise-time step in calibration reports actual transition times; if
+  the monitor's response is so slow that the per-frame transition
+  isn't complete before the next refresh, the bit pattern is
+  unreliable. OLED is recommended for timing-critical work.
+- Monitor refresh rate vs. video fps: the decoder copes with
+  refresh aliasing (e.g. 60 Hz monitor displaying a 45 fps video,
+  where each video frame spans 1 or 2 refreshes) -- it counts video
+  frame transitions, not monitor refreshes. But for the cleanest
+  recordings, prefer a monitor refresh rate that's an integer
+  multiple of the video fps.
 - The calibration assumes the PDs don't move between calibration and
   measurement. If the PCB is jostled, re-calibrate.
 - Multiplexer crosstalk on NI cards is real but tiny at the
   calibration's default 5 kHz DC sample rate. Higher sample rates
-  (>= 50 kHz, e.g. for the rise-time measurement) are run single-channel
-  to sidestep the mux entirely.
-- The decoder is not included in this repository -- different consumers
-  want different downstream behaviors (frame index per DAQ sample,
-  per-frame onset timestamp, etc.). The calibration JSON contains
-  everything needed; see the per-PD `baseline_dark_v` /
-  `baseline_bright_v` fields for thresholding.
+  (>= 50 kHz, e.g. for the rise-time measurement) are run single-
+  channel to sidestep the mux entirely.
+- The decoder requires the recording to be in volts (or supply
+  `scale=` to convert raw ADC steps -- the `SCALE_PRESETS` dict in
+  `decode_sync_tags.py` lists named factors for Intan inputs). A
+  bare `scale=1.0` on Intan ADC-step data still produces a correct
+  decode (Otsu's thresholding is unit-agnostic), but the
+  threshold-vs-calibration sanity warnings will be noisy because
+  units don't line up.
+- For "what was on screen at neural-spike sample S?" lookups, use
+  the **original (untagged) video** to read frame content. The
+  decoder maps `decoded.frame_number N` directly to the original
+  source video's frame N (guard frames are sync-OFF and don't enter
+  the segment). Using the tagged video for content lookup also
+  works, just with the leading guards offsetting the indices.
