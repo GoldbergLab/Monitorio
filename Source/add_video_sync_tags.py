@@ -93,6 +93,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -310,6 +312,22 @@ def add_video_sync_tags(
         ["-cq", str(int(quality))] if is_nvenc else ["-crf", str(int(quality))]
     )
 
+    # Always encode to a local temp file and move the finished result into
+    # place, rather than letting ffmpeg mux straight to `video_out`. If the
+    # destination is a network share, direct muxing is pathologically slow:
+    # the MP4 muxer seeks backward per packet to patch its sample tables,
+    # and every seek/write is a synchronous network round-trip, so even an
+    # 8-second clip can take tens of minutes. Encoding to a local temp keeps
+    # all that thrashing on a fast local disk; the move is then a single
+    # rename (same volume) or one sequential copy (e.g. onto the share),
+    # which is orders of magnitude faster than per-packet round-trips. The
+    # temp lives in the system temp dir, which is local.
+    fd, tmp_name = tempfile.mkstemp(
+        suffix=video_out.suffix or ".mp4", prefix="monitorio_tag_",
+    )
+    os.close(fd)
+    encode_target = Path(tmp_name)
+
     # ffmpeg read: decode video-only rgb24 stream to stdout.
     read_cmd = [
         "ffmpeg", "-loglevel", "error", "-i", str(video_in),
@@ -328,7 +346,7 @@ def add_video_sync_tags(
         "-c:v", codec, "-preset", eff_preset, "-pix_fmt", "yuv420p",
         *quality_args,
         "-c:a", "copy",
-        str(video_out),
+        str(encode_target),
     ]
 
     read_proc = subprocess.Popen(
@@ -456,12 +474,26 @@ def add_video_sync_tags(
         read_rc = read_proc.wait()
         write_rc = write_proc.wait()
 
+    def _cleanup_temp() -> None:
+        try:
+            encode_target.unlink()
+        except OSError:
+            pass
+
     if read_rc not in (0, None):
+        _cleanup_temp()
         err = read_proc.stderr.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"ffmpeg (read) exited with {read_rc}:\n{err}")
     if write_rc not in (0, None):
+        _cleanup_temp()
         err = write_proc.stderr.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"ffmpeg (write) exited with {write_rc}:\n{err}")
+
+    # Encode succeeded; move the local temp into its final destination.
+    # shutil.move renames within a volume and copies+deletes across volumes
+    # (e.g. onto a network share), so this is the one sequential transfer
+    # that replaces the muxer's per-packet round-trips.
+    shutil.move(str(encode_target), str(video_out))
 
     # Write the sidecar manifest <video_out>.tags.json so the decoder can
     # recover sync-bit setting + per-bit channel assignment without the
